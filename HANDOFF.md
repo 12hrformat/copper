@@ -697,8 +697,69 @@ copper: charge complete
   -> rollback:  restored etc_copper_demo.txt → .../etc/copper/demo.txt
 ```
 
-Apply, backup, idempotent skip, and restore are all confirmed. What is **not**
-confirmed is the same cycle on a booted system.
+Apply, backup, idempotent skip, and restore are all confirmed. The same cycle
+was later run on a booted system (artifact6) from the live shell.
+
+## The second round: the backup did not exist when it was needed
+
+Reported off a real boot: `copper charge` then `copper rollback`, and rollback
+had nothing to restore. Cause was in the design, not a typo. `charge` copied a
+file **at the moment it patched it**, so a machine where nothing needed
+patching produced no backups at all — which is precisely the machine you are
+most likely to want to roll back, because something else went wrong and you
+are looking for a restore point.
+
+Three things changed as a result.
+
+**`charge` snapshots before it touches anything.** Every run writes a new
+directory under `/var/backups/copper/` named for the time, holding a copy of
+every file the database refers to that is actually installed, plus a
+`MANIFEST` mapping each copy back to its real path. Whether or not anything
+then needs fixing. This is what makes rollback mean "put these files back the
+way they were at 16:30" rather than "undo the one file the patch engine
+happened to reach first".
+
+**`rollback --latest`** restores the newest snapshot, and `<name>` restores a
+specific one. A restore copies the current file into a `pre-rollback-*`
+directory first, so a rollback is itself reversible. `pre-rollback-*` is
+deliberately excluded from the list of restore points — a restore point must
+never be the thing a rollback rolls back.
+
+**`rollback` with nothing to restore says so and exits non-zero.** It used to
+print a listing and exit 0, so a run that found nothing looked like a job done
+properly.
+
+### Two parser bugs found while testing this
+
+Both were only visible because the test used a **two-entry** database.
+
+**The splitter read only the last entry.** It buffered from the outermost `{`,
+which is the object *containing* `"hotfixes": [ ... ]`, so it concatenated the
+whole file into a single line. Every field was then extracted from that line
+with a greedy `sed`, which returns the last match — so every field came back
+as the last entry's value and every entry but the last was invisible. No error,
+no change, no way to tell. The shipped database has exactly one entry and one
+entry always works, so it survived a real boot and a real `copper charge`.
+Rewritten to buffer per object and key off each object's *own* keys, which is
+what distinguishes an entry from the wrapper.
+
+**`restore_single` inverted its own transform.** Backups were named
+`tr '/' '_'`, and the reverse used `sed 's|__|/|g'` — a *double* underscore,
+which `tr` can never emit. Fixed, though it is now only the fallback path for
+old-format loose backups; snapshots are the normal route.
+
+### And one that only a build gate can catch
+
+An apostrophe inside a comment within the single-quoted `awk` program closes
+the shell string early, so the rest of the awk is handed to the shell to run.
+It surfaces as `buf[depth]: not found` and points at nothing. The comment in
+`copper-charge.sh` now says so; `iso/assert-hotfix-db.sh` runs the real
+parser at build time and requires one output line per `fail_code` key in the
+database, so a parser that stops working fails the build instead of shipping.
+
+`tests/charge.sh` covers the cycle in a sandbox, including the reported case as
+step 9: charge when nothing needs patching must still leave rollback something
+to work with. It runs in CI as a fast `checks` job alongside the ISO build.
 
 ## Testing it offline
 
@@ -762,11 +823,30 @@ Being precise here matters, because it is easy to mistake "it compiles" for
   plus a ~60-line terminal emulator (CUP, ED, EL, cursor show/hide, CR/LF/BS,
   scrolling) rendered every screen: the animation, the form empty, a field
   typed into, a rejected username, masked passwords, and a 50x14 terminal too
-  small for the table. Width tracking is how the box was caught not wrapping.
+  small for the table. Width tracking is how the box was caught not wrapping,
+  and a **scroll counter** is how the animation's jump was pinned down — it now
+  counts zero scrolls through the whole run, because every row is placed at an
+  absolute screen row instead of being stacked by newline.
+  The emulator is what caught the cursor landing one row below its own field,
+  and the diagnostics-over-the-table bug. Note the previous run of this test
+  used a 6-character name over a 6-character hint, which covered the case
+  *exactly* and so hid the debris bug; the retry deliberately types a short
+  answer over a long hint.
 - **The hostile-answer test.** `; touch /tmp/COPPER_PWNED` typed as a hostname
   and `` UTC`touch /tmp/COPPER_PWNED` `` as a timezone: both refused, the
   file was never created, and the values the wizard actually collected were the
   valid ones that followed.
+- **`tests/charge.sh`** — 15 stages against the three real scripts in a `/tmp`
+  sandbox, 50 assertions. Covers the reported case directly: a charge that
+  applies nothing must still take a snapshot, and rollback must then have
+  something to restore. Also `--status` changing nothing, `--backup` applying
+  nothing, the apply/rollback cycle repeating, `pre-rollback-*` never being
+  offered as a restore point, old-format loose backups still restoring, and
+  wrong exit codes.
+- **Each new build gate, proven to fire.** A gate nobody has watched fail is
+  not a gate. Each was given a deliberate fault in turn — an array assignment in
+  a busybox tool, an unterminated quote, an apostrophe inside the awk program —
+  and each was confirmed to report it.
 
 ## Has never run
 
@@ -798,6 +878,24 @@ not a bug.
 - `build_copper` — checks the staged tree actually contains the binaries and
   lease script `switch_root` needs, and that `sbin/init` is a symlink to
   `/usr/bin/copper-init`. Uses `readlink`, not `-e`; see bug #5.
+- `assert_shell_scripts_parse` — `bash -n` over every tracked `*.sh`, then a
+  POSIX-shell `-n` over the three that run under busybox on a live system.
+  **bash, not `sh`, for the first pass**: `build.sh` uses process substitution
+  and is run with bash, so checking it with a POSIX shell reports an error in
+  code that runs fine every day. What the POSIX pass catches is grammar ash
+  lacks — arrays, the `function` keyword, process substitution. What it does
+  **not** catch is bash builtins spelled like ordinary commands: dash accepts
+  `[[ -n "$1" ]]`, because to its parser that is a command called `[[`. Catching
+  those needs a shell that *runs* the code, which is what `tests/charge.sh` is.
+- `assert_hotfix_db_readable` — runs the real parser via
+  `copper-charge --dump-entries` and requires one output line per `fail_code`
+  key in the database, with no empty field. This is the gate for the
+  "only the last entry is ever read" bug, which shipped once because the
+  database had exactly one entry.
+- `assert_no_empty_files`, `assert_commands_reachable` — as before. The
+  reachability list now includes `copper`, `copper-charge` and
+  `copper-rollback`, so a rename that breaks `copper charge` fails the build
+  rather than a live machine.
 
 ---
 
@@ -809,6 +907,24 @@ hashes `iso/build.sh`, `iso/live/init`, `iso/boot/grub.cfg`,
 change to *any one* of those throws away the whole `iso/work/` cache. The cache
 is saved even on failure (`if: always()`), so a red run still warms the next
 one. Batch changes; don't dribble.
+
+`iso/copper.sh`, `iso/copper-charge.sh` and `iso/copper-rollback.sh` are
+deliberately **not** in the cache key. Adding them would invalidate every
+cache for a cosmetic gain, and correctness does not need it: the `copper`
+stage stamps itself against those three files, so a restored tree whose
+scripts changed rebuilds that stage regardless of what the cache key says.
+
+**PowerShell eats bash quoting in `wsl ... bash -c "..."`.** Dollar signs,
+backslashes and `#` get interpreted by PowerShell before WSL ever sees them,
+producing errors that have nothing to do with the command you wrote. Write the
+script to a file under the temp dir and run `wsl -d kali-linux -- bash
+/mnt/c/.../script.sh`. Everything in this repo's testing was done that way for
+this reason.
+
+**An apostrophe in a comment inside `awk '...'` is not a comment.** The quote
+closes the shell string and the shell runs the rest of the program. The symptom
+(`buf[depth]: not found`) names an awk construct, so it reads like an awk bug
+and costs a while. This happened once, in the hotfix parser.
 
 **The kernel command line's last `console=` is `/dev/console`.** See bug #7.
 This is the single most counter-intuitive thing in the whole boot, it produces

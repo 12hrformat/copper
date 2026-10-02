@@ -24,6 +24,31 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Fast, and runs first. Nothing here builds anything: it is the set of
+  # checks that catch a mistake in seconds instead of after a fifteen-minute
+  # kernel build, and it needs no toolchain beyond a POSIX shell.
+  #
+  # Kept as its own job so a failure here is obviously not a compile error.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: copper-sh smoke test
+        run: |
+          make -s
+          ./tests/smoke.sh
+
+      # Needs root, because the tools insist on it. The reported bug -- a
+      # charge that applied nothing left no backup for rollback to use -- is
+      # only visible end to end, against the real scripts.
+      - name: charge / rollback cycle
+        run: sudo ./tests/charge.sh
+
+  # Deliberately NOT `needs: checks`. The checks job and this one run
+  # concurrently, so a shell-level mistake is reported within a minute while
+  # the kernel is still building, without withholding the artifact from a run
+  # that only failed the fast checks.
   build:
     runs-on: ubuntu-latest
     steps:

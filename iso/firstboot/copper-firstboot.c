@@ -90,7 +90,22 @@ static void ui_init(void) {
 }
 
 static void msleep(int ms) { usleep((useconds_t)ms * 1000); }
-static void clr(void)      { fputs("\033[2J\033[H", stdout); }
+
+/* Wipe the screen and put the cursor at the top left.
+
+   The DECSTBM reset (\033[r) before the erase is not decoration. The shield is
+   40 rows drawn onto a 25-row screen, so the console scrolls fifteen times,
+   and a console sitting inside a scroll region counts those lines against the
+   region rather than the whole screen. \033[H would then home to the top of
+   the *region*, not the top of the screen, and everything drawn afterwards
+   would sit low by however much had scrolled away.
+
+   That is the "weird shift" half way through the boot: the shield scrolls,
+   the clear does not put the cursor back where this code thinks it is, and
+   the wordmark and the form both land low. Resetting the region first means
+   the position of everything after this point is decided here and not by
+   whatever the console happened to be doing. */
+static void clr(void)      { fputs("\033[r\033[2J\033[H", stdout); }
 static void at(int r, int c) { printf("\033[%d;%dH", r, c); }
 static void cursor_show(int on) { fputs(on ? "\033[?25h" : "\033[?25l", stdout); }
 
@@ -122,23 +137,56 @@ static void drain_keys(void) {
 /* Type the shield in a row at a time, then wipe it and show the wordmark, then
    wipe that too and hand over to the questions.
 
-   The shield is 40 rows and the console is 25, so it cannot be centred -- it
-   scrolls, which is the right behaviour for a boot: the art builds upward out
-   of the log. The wordmark and the form both fit, so those are centred. */
+   The shield is 40 rows by 77 columns. A standard VGA console is 25 by 80, so
+   it does not fit vertically, and letting it try is what made the animation
+   appear to jump half way through:
+
+     - Printing all 40 rows fills the display and then scrolls. Every row moves
+       up by one character cell at once, and a hypervisor repainting the text
+       buffer incrementally shows that as a frame or two of the screen caught
+       mid-move. It looks like the whole logo jerks sideways at exactly the
+       point the last visible row is reached -- which is over half way down a
+       40-row drawing, which is why it read as "shifts at the half".
+
+     - Printing 77 columns onto a terminal narrower than 77 wraps every art row
+       onto two, so the logo grows two rows at a time and tears. The gate only
+       requires 46 columns, so this was reachable.
+
+   So the art is clipped to the screen rather than allowed to overrun it, and
+   every row is placed at an absolute screen row with no newline after it. That
+   makes the console never scroll: on a tall terminal the whole shield appears,
+   and on a standard one the bottom is cut off and the logo grows steadily
+   downward without moving at all. */
 static void boot_sequence(void) {
     if (!ui_fancy) { banner(); return; }
 
     cursor_show(0);
     clr();
 
+    int vis_rows = COPPER_SHIELD_ROWS;
+    int vis_cols = COPPER_SHIELD_WIDTH;
+    if (vis_cols > term_cols) vis_cols = term_cols;
+
+    /* Start row: centre it when it fits, otherwise show it from the top and
+       let the bottom be the part that gets cut. */
+    int start_row = 1;
+    if (vis_rows > term_rows) {
+        vis_rows = term_rows;
+    } else {
+        start_row = (term_rows - vis_rows) / 2 + 1;
+    }
+
+    int indent = (term_cols - vis_cols) / 2;
+    if (indent < 0) indent = 0;
+
     /* Draw a row at a time. If somebody presses a key the pause stops, but the
        remaining rows are still drawn -- instantly -- so that skipping produces
        the finished shield rather than a half-drawn one. */
     int skip = 0;
-    int indent = (term_cols - COPPER_SHIELD_WIDTH) / 2;
-    if (indent < 0) indent = 0;
-    for (int i = 0; i < COPPER_SHIELD_ROWS; i++) {
-        printf("%*s%s\n", indent, "", COPPER_SHIELD[i]);
+    for (int i = 0; i < vis_rows; i++) {
+        at(start_row + i, indent + 1);
+        printf("%.*s", vis_cols, COPPER_SHIELD[i]);
+        fflush(stdout);
         if (!skip) {
             msleep(BOOT_LINE_DELAY_MS);
             if (key_pending()) skip = 1;
@@ -152,11 +200,18 @@ static void boot_sequence(void) {
     msleep(350);
     clr();
 
-    int pad = (term_rows - COPPER_WORDMARK_ROWS) / 2;
-    if (pad < 0) pad = 0;
-    for (int i = 0; i < pad; i++) putchar('\n');
-    for (int i = 0; i < COPPER_WORDMARK_ROWS; i++)
-        printf("%s\n", COPPER_WORDMARK[i]);
+    int wm_rows = COPPER_WORDMARK_ROWS;
+    int wm_cols = COPPER_WORDMARK_WIDTH;
+    if (wm_cols > term_cols) wm_cols = term_cols;
+    int wm_top = (term_rows - wm_rows) / 2 + 1;
+    if (wm_top < 1) wm_top = 1;
+    int wm_left = (term_cols - wm_cols) / 2 + 1;
+    if (wm_left < 1) wm_left = 1;
+    for (int i = 0; i < wm_rows; i++) {
+        at(wm_top + i, wm_left);
+        printf("%.*s", wm_cols, COPPER_WORDMARK[i]);
+    }
+    fflush(stdout);
     msleep(1400);
 
     clr();
@@ -196,7 +251,16 @@ static int valid_tz(const char *s);
 
 struct field {
     const char *label;
-    const char *hint;      /* what to type, or what will be used if blank */
+    /* Extra guidance, shown on the status line under the table.
+
+       This used to be drawn *inside* the value cell, which put text where the
+       answer goes. Keystrokes then overwrote only the front of it: type "Bo"
+       over the hint "friend" and the screen showed "Boiend", with four
+       characters of hint left sitting in the field. The only way past that was
+       to backspace the debris by hand before typing anything, which is what a
+       field you have to clear first always feels like. A value cell now starts
+       genuinely empty and the help lives where help belongs. */
+    const char *help;
     const char *ask;       /* the status line while this one is live */
     const char *reject;    /* why the last answer was not accepted */
     char value[FIELD_CAP];
@@ -222,25 +286,41 @@ static int ok_pw(const char *s)   { return s[0] != '\0'; }
    there is no way to see at a glance that a missing `secret` is 0 rather than
    a mistake -- which for a password field is the difference between masked and
    printed in the clear. */
-#define FIELD(lbl, hint, prompt, rej, sec, chk) \
-    { (lbl), (hint), (prompt), (rej), {0}, (sec), 0, (chk) }
+#define FIELD(lbl, hlp, prompt, rej, sec, chk) \
+    { (lbl), (hlp), (prompt), (rej), {0}, (sec), 0, (chk) }
 
 static struct field fields[F_COUNT] = {
-    FIELD("Your name",     "friend",                 "What should Copper call you?", 0, 0, NULL),
-    FIELD("Username",      "letters, digits, dash, underscore",
+    FIELD("Your name",     "Enter alone to use \"friend\"",
+          "What should Copper call you?", 0, 0, NULL),
+    FIELD("Username",      "letters, digits, dash and underscore",
           "Pick a login name", "Letters, digits, dash and underscore only", 0, valid_user),
-    FIELD("Hostname",      "copper",                 "Name this machine",
+    FIELD("Hostname",      "Enter alone to use \"copper\"",
+          "Name this machine",
           "Letters, digits, dot and dash only", 0, ok_host),
-    FIELD("Root password", "at least one character", "Set the root password",
+    FIELD("Root password", 0,
+          "Set the root password",
           "A password cannot be blank", 1, ok_pw),
-    FIELD("Your password", "at least one character", "Set your own password",
+    FIELD("Your password", 0,
+          "Set your own password",
           "A password cannot be blank", 1, ok_pw),
-    FIELD("Timezone",      "UTC",                    "Timezone, e.g. Europe/London",
+    FIELD("Timezone",      "Enter alone to use \"UTC\", or Europe/London",
+          "Timezone, e.g. Europe/London",
           "That does not look like a timezone", 0, ok_tz),
 };
 
 /* |   label(18)   value */
 #define LABEL_COL 18
+
+/* Spaces between the left-hand wall and the label. */
+#define BOX_PAD 3
+
+/* 1-based screen column where a field's value begins.
+
+   Derived from the same numbers that format the row, because the one way this
+   went wrong before was for the two to be computed separately and disagree:
+   the box drew flush left while the cursor sat elsewhere, and every keystroke
+   landed somewhere other than where the character had just been drawn. */
+#define VALUE_COL (box_left + 1 + BOX_PAD + LABEL_COL + 2)
 
 static int box_w(void) {
     int w = term_cols - 8;
@@ -249,14 +329,8 @@ static int box_w(void) {
     return w;
 }
 
-/* Where the box starts, in columns from the left edge.
-
-   This is state rather than a parameter because there is a second consumer of
-   the number: render_form() positions the cursor by adding LABEL_COL to it, and
-   when the two disagreed the box drew hard against the left edge while the
-   cursor sat seven columns further right -- so typing landed after the hint
-   instead of over it, and every answer came out looking like the default with
-   your text appended to it. One number, one owner, no way to get it wrong. */
+/* Where the box starts, in columns from the left edge. One owner, because
+   both the drawing and the cursor placement need it. */
 static int box_left;
 
 static void box_begin(int w, int rows) {
@@ -265,32 +339,34 @@ static void box_begin(int w, int rows) {
     (void)rows;
 }
 
-static void box_pad(void) {
-    for (int i = 0; i < box_left; i++) putchar(' ');
-}
+/* Both of these place themselves by absolute screen coordinates.
 
-static void box_line(const char *text, int w) {
+   They used to indent with leading spaces and stack with newlines, which made
+   every line's position depend on where the cursor happened to be -- and
+   after a scrolling animation, that is not a place this code can reason about.
+   Absolute rows cannot drift. */
+static void box_line(const char *text, int w, int row) {
     int room = w - 2;
     int len = (int)strlen(text);
     /* Truncate, never wrap.
 
-       On a narrow terminal a hint can easily be wider than the box -- at 50
-       columns there are 17 columns of value cell and the username hint is 31
-       characters -- and a wrapped line breaks the right-hand wall off and
-       leaves a fragment on the next row. A table with a missing wall looks
-       broken; a table with a clipped cell looks deliberate. */
+       The status line carries the prompt plus the help, and at 50 columns that
+       is longer than the box. A wrapped line breaks the right-hand wall off
+       and leaves a fragment on the row below, which at that point is a field
+       row -- so the table loses a wall AND a value. A table with a clipped
+       cell looks deliberate; a table with a missing wall looks broken. */
     if (len > room) len = room;
     int pad = room - len;
-    box_pad();
-    printf("|%.*s%*s|\n", len, text, pad, "");
+    at(row, box_left + 1);
+    printf("|%.*s%*s|", len, text, pad, "");
 }
 
-static void box_rule(int w) {
+static void box_rule(int w, int row) {
     char bar[80];
     memset(bar, '-', (size_t)(w - 2));
     bar[w - 2] = '\0';
-    box_pad();
-    printf("+%s+\n", bar);
+    at(row, box_left + 1);
+    printf("+%s+", bar);
 }
 
 /* Draw the whole form and leave the cursor sitting in the active field's value
@@ -299,17 +375,26 @@ static void render_form(int active, const char *status) {
     int w = box_w();
     int total = 4 + F_COUNT + 2;
     int top = (term_rows - total) / 2;
-    if (top < 0) top = 0;
+    if (top < 1) top = 1;   /* screen rows are 1-based; row 0 is not a row */
 
     clr();
-    for (int i = 0; i < top; i++) putchar('\n');
     box_begin(w, total);
 
-    box_rule(w);
-    box_line("   Copper Linux  -  first boot setup", w);
-    box_rule(w);
+    /* Every line is placed at a row this code computed, counted from here.
+       Nothing below depends on where the cursor happens to be. */
+    int r = top;
+    box_rule(w, r++);
+    box_line("   Copper Linux  -  first boot setup", w, r++);
+    box_rule(w, r++);
 
-    for (int i = 0; i < F_COUNT; i++) {
+    /* Where the first field lands, taken from the same counter that drew the
+       rows rather than counted out again by hand. An off-by-one here is
+       invisible in the source and very visible on screen: the cursor sits one
+       row below its own field, so what you type appears in the next
+       question. */
+    const int first_field = r;
+
+    for (int i = 0; i < F_COUNT; i++, r++) {
         char shown[220];
         const struct field *f = &fields[i];
         if (f->secret && f->has_value) {
@@ -320,18 +405,30 @@ static void render_form(int active, const char *status) {
         } else if (f->has_value) {
             snprintf(shown, sizeof shown, "%s", f->value);
         } else {
-            snprintf(shown, sizeof shown, "%s", f->hint);
+            shown[0] = '\0';     /* empty. Never a hint -- see struct field. */
         }
         char row[256];
-        snprintf(row, sizeof row, "   %-*s %s", LABEL_COL, f->label, shown);
-        box_line(row, w);
+        snprintf(row, sizeof row, "%*s%-*s %s", BOX_PAD, "", LABEL_COL,
+                 f->label, shown);
+        box_line(row, w, r);
     }
 
-    box_rule(w);
-    box_line(status, w);
-    box_rule(w);
+    box_rule(w, r++);
 
-    if (active >= 0) at(top + 4 + active, box_left + 4 + LABEL_COL + 2);
+    /* The prompt, plus whatever the live field needs to know -- including what
+       pressing Enter on its own will do, which used to be shown inside the cell
+       it would have to be typed over. */
+    char line[256];
+    const char *help =
+        (active >= 0 && active < F_COUNT) ? fields[active].help : 0;
+    if (help && *help)
+        snprintf(line, sizeof line, " %s  --  %s", status, help);
+    else
+        snprintf(line, sizeof line, " %s", status);
+    box_line(line, w, r++);
+    box_rule(w, r);
+
+    if (active >= 0) at(first_field + active, VALUE_COL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -810,23 +907,38 @@ static void draw_progress(int upto) {
     while (apply_steps[n]) n++;
     int total = 4 + n + 2;
     int top = (term_rows - total) / 2;
-    if (top < 0) top = 0;
+    if (top < 1) top = 1;
 
     clr();
-    for (int i = 0; i < top; i++) putchar('\n');
     box_begin(w, total);
-    box_rule(w);
-    box_line("   Copper Linux  -  setting things up", w);
-    box_rule(w);
-    for (int i = 0; i < n; i++) {
+
+    int r = top;
+    box_rule(w, r++);
+    box_line("   Copper Linux  -  setting things up", w, r++);
+    box_rule(w, r++);
+    for (int i = 0; i < n; i++, r++) {
         char row[256];
-        snprintf(row, sizeof row, "   [%c] %s",
+        snprintf(row, sizeof row, "%*s[%c] %s", BOX_PAD, "",
                  i < upto ? 'x' : ' ', apply_steps[i]);
-        box_line(row, w);
+        box_line(row, w, r);
     }
-    box_rule(w);
-    box_line("one moment", w);
-    box_rule(w);
+    box_rule(w, r++);
+    box_line(" one moment", w, r++);
+    box_rule(w, r);
+
+    /* Step off the box before returning.
+
+       Nothing here ends in a newline any more -- the rows are placed by
+       coordinate, not stacked by carriage return -- so the cursor is still
+       sitting on the last rule when this returns. Anything printed next, such
+       as the reason an account could not be created, then starts in the middle
+       of the table and overwrites it: the box ends up with a run of text
+       across its bottom wall and the diagnostic is unreadable as well.
+
+       Park on the first free row below instead. */
+    int park = r + 1;
+    if (park > term_rows) park = term_rows;
+    at(park, 1);
 }
 
 static void screen_done(const char *name) {
@@ -839,22 +951,24 @@ static void screen_done(const char *name) {
     }
     int w = box_w();
     int top = (term_rows - 5) / 2;
-    if (top < 0) top = 0;
+    if (top < 1) top = 1;
 
     clr();
-    for (int i = 0; i < top; i++) putchar('\n');
     box_begin(w, 5);
-    box_rule(w);
+
+    int r = top;
+    box_rule(w, r++);
     {
         char l1[256], l2[256], l3[256];
-        snprintf(l1, sizeof l1, "   Done -- welcome, %s.", name);
-        snprintf(l2, sizeof l2, "   Copper is yours.");
-        snprintf(l3, sizeof l3, "   Type 'help' to see the builtins.");
-        box_line(l1, w);
-        box_line(l2, w);
-        box_line(l3, w);
+        snprintf(l1, sizeof l1, "%*sDone -- welcome, %s.", BOX_PAD, "", name);
+        snprintf(l2, sizeof l2, "%*sCopper is yours.", BOX_PAD, "");
+        snprintf(l3, sizeof l3, "%*sType 'help' to see the builtins.",
+                 BOX_PAD, "");
+        box_line(l1, w, r++);
+        box_line(l2, w, r++);
+        box_line(l3, w, r++);
     }
-    box_rule(w);
+    box_rule(w, r);
     msleep(2600);
     /* Hand the screen over clean: copper-sh prints its own banner next, and
        two banners stacked in 25 rows looks like a mistake. */
@@ -898,8 +1012,9 @@ int main(void) {
         return 1;
     }
 
-    /* Blank means "use the default shown as the hint". A username is the one
-       field with no default: an account called "" is not an account. */
+    /* Blank means "use the default", which the status line tells you before you
+       type anything. A username is the one field with no default: an account
+       called "" is not an account. */
     snprintf(name, sizeof name, "%s",
              fields[F_NAME].value[0] ? fields[F_NAME].value : "friend");
     snprintf(user, sizeof user, "%s", fields[F_USER].value);
@@ -989,7 +1104,7 @@ int main(void) {
             run("ln -sf /usr/share/zoneinfo/%s /etc/localtime", tz);
             run("echo %s > /etc/timezone", tz);
         } else {
-            printf("(timezone %s not found — staying on UTC)\n", tz);
+            printf("(timezone %s not found, staying on UTC)\n", tz);
         }
     }
     draw_progress(4);

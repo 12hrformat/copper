@@ -446,6 +446,8 @@ build_rootfs() {
 
   assert_no_empty_files
   assert_commands_reachable
+  assert_shell_scripts_parse
+  assert_hotfix_db_readable
 }
 
 # ---------------------------------------------------------------
@@ -534,6 +536,7 @@ assert_commands_reachable() {
       adduser addgroup chpasswd \
       ip ifconfig route ping wget nslookup \
       mount umount switch_root \
+      copper copper-charge copper-rollback \
       vi ; do
 
     found=""
@@ -583,6 +586,81 @@ assert_commands_reachable() {
     exit 1
   fi
   echo "rootfs: every required command is reachable by name on PATH"
+}
+
+# ---------------------------------------------------------------
+# 6c. no shell script in the repo may fail to parse
+# ---------------------------------------------------------------
+# A quoting mistake in a shell script does not stop it from running: the shell
+# starts executing whatever the broken quoting handed it. One real example --
+# an apostrophe inside a comment within a single-quoted awk program closed the
+# quote, and the remainder of the awk was executed as shell, failing as
+# "buf[depth]: not found" with nothing pointing at the real cause.
+assert_shell_scripts_parse() {
+  local f bad=0
+
+  # bash -n, not sh -n. build.sh uses process substitution and is run with
+  # bash, so checking it with a POSIX shell reports a syntax error in code
+  # that runs perfectly well every day.
+  for f in $(cd "$ROOT" && git ls-files '*.sh' 2>/dev/null); do
+    [ -f "$ROOT/$f" ] || continue
+    if ! out=$(bash -n "$ROOT/$f" 2>&1); then
+      echo "build: $f does not parse:" >&2
+      echo "$out" | sed 's/^/       /' >&2
+      bad=1
+    fi
+  done
+  [ "$bad" -eq 0 ] || exit 1
+
+  # The three tools that run on a live system declare #!/bin/busybox sh and
+  # are executed by busybox ash, not by bash. Grammar the POSIX shell does not
+  # have -- array assignment, the `function` keyword, process substitution --
+  # would fail on the machine this ISO is for, which is the only place it
+  # matters. So check those against a POSIX shell too, when one is available.
+  #
+  # What this does NOT catch: bash builtins that happen to be spelled like
+  # ordinary commands. dash -n accepts `[[ -n "$1" ]]`, because to its parser
+  # that is a command called "[[" with two arguments, and it only fails when it
+  # runs. Catching those needs a shell that runs the code, not one that reads
+  # it, which is what the charge tests do.
+  local posix=""
+  for c in dash ash busybox; do
+    command -v "$c" >/dev/null 2>&1 && { posix="$c"; break; }
+  done
+
+  if [ -n "$posix" ]; then
+    for f in iso/copper.sh iso/copper-charge.sh iso/copper-rollback.sh; do
+      [ -f "$ROOT/$f" ] || continue
+      if ! out=$("$posix" -n "$ROOT/$f" 2>&1); then
+        echo "build: $f is not POSIX sh, and it runs under busybox ash:" >&2
+        echo "$out" | sed 's/^/       /' >&2
+        bad=1
+      fi
+    done
+    [ "$bad" -eq 0 ] || exit 1
+    echo "build: every shell script parses, and the busybox tools are POSIX sh"
+  else
+    echo "build: every shell script parses (no POSIX shell here to check the busybox tools)"
+  fi
+}
+
+# ---------------------------------------------------------------
+# 6d. the hotfix database must survive the parser that reads it
+# ---------------------------------------------------------------
+# The parser is hand-written awk, because the live system has no python3. It
+# once concatenated the whole file into a single line, so every field came
+# back as the last entry value and all but the last entry were invisible --
+# which worked perfectly, because the database had exactly one entry.
+#
+# So this does not test a copy of the parser. It runs the real script and
+# compares what comes out against what is in the file.
+assert_hotfix_db_readable() {
+  ( "$ROOT/iso/assert-hotfix-db.sh" ) || {
+    echo "build: the hotfix database did not survive the parser." >&2
+    echo "       Every entry but the last would be silently ignored on a" >&2
+    echo "       live system, with no error and no change." >&2
+    exit 1
+  }
 }
 
 # ---------------------------------------------------------------
