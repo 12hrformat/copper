@@ -446,28 +446,86 @@ build_rootfs() {
   mv -f "$new" "$old"
 
   assert_no_empty_files
-  assert_applets_work
+  assert_commands_reachable
 }
 
 # ---------------------------------------------------------------
-# 6c. the applets people actually type must be runnable
+# 6b. no command in the image may be an empty REGULAR file
 # ---------------------------------------------------------------
-# -x is not enough. A zero-byte file is executable as far as the shell is
-# concerned, and so is a symlink pointing nowhere useful, but neither can be
-# run. This walks the list of commands a person reaches for in a Copper shell
-# and actually executes each one through the staged busybox, so a broken applet
-# is a build failure instead of a surprise on someone's first boot.
+# Narrow on purpose, and deliberately not about symlinks.
 #
-# This is here because 310 applets shipped as empty files and the only symptom
-# was "command not found" for commands that were present and compiled in.
-assert_applets_work() {
-  local BB="$TGT/bin/busybox"
-  [ -x "$BB" ] || { echo "rootfs: no busybox to test against" >&2; exit 1; }
+# A zero-byte regular file that is supposed to be an executable is fatal:
+# execve() finds it, refuses it, and the shell reports "command not found"
+# for a command that is plainly listed. An empty *symlink* is not a thing --
+# a symlink has no size of its own; it has a target.
+#
+# `find -type f` does not match symlinks (find defaults to -P, no follow), so
+# this ignores every one of the 600-odd applet links and looks only at real
+# files. That distinction matters: an earlier version of this gate was aimed
+# at "310 empty files" which turned out to be a measurement error. p7zip
+# reports those entries correctly as symlinks -- Mode = lr-xr-xr-x,
+# Symbolic Link = ../bin/busybox -- but silently writes some of them to disk as
+# 0-byte regular files on extraction. Inspect the image with `mount -o loop`
+# or bsdtar, never with p7zip, or you will chase this ghost again.
+#
+# A few files are legitimately empty, so they are named rather than allowing a
+# blanket exemption.
+assert_no_empty_files() {
+  local empties
+  empties=$( cd "$TGT" && find . -type f -size 0 \
+    ! -path './etc/motd' \
+    ! -path './etc/timezone' \
+    ! -path './var/log/*' \
+    ! -name '*.uuid' \
+    # Vestigial cosmopolitan artifact. It is shipped empty and grub.cfg never
+    # boots it -- the menu entries load /boot/vmlinuz and /boot/initrd.img --
+    # so an empty mach_kernel costs nothing. Worth knowing it is a no-op file.
+    ! -name 'mach_kernel' \
+    -print 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort )
 
-  # Chosen because they are what the wizard, the init scripts, the hotfix
-  # tools and an ordinary person at a prompt all reach for. If one of these is
-  # broken the system is visibly broken.
-  local applet
+  if [ -z "$empties" ]; then
+    echo "rootfs: no empty regular files in the staged tree"
+    return 0
+  fi
+
+  local n
+  n=$(printf '%s\n' "$empties" | wc -l)
+  {
+    echo "rootfs: $n empty regular file(s) in the staged tree."
+    echo "If any of these is meant to be executable, the shell will answer"
+    echo "'command not found' for it, because execve() cannot run an empty file."
+    echo
+    printf '%s\n' "$empties" | head -25
+    [ "$n" -gt 25 ] && echo "  ... and $((n - 25)) more"
+    echo
+    echo "Usual cause: a symlink was overwritten without --remove-destination,"
+    echo "so the copy wrote through the link and produced an empty file."
+  } >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------
+# 6c. the commands people actually type must be reachable BY NAME
+# ---------------------------------------------------------------
+# This tests the thing that actually broke, which is not "is the file there".
+#
+# `ip` and `ifconfig` were present, compiled into the shipped busybox, and
+# correctly symlinked the entire time, and still answered "command not found".
+# They live in sbin. PID 1 started with no PATH in its environment, so execvp
+# fell back to the kernel's compiled-in default -- /bin:/usr/bin -- and sbin
+# was never searched. Every existence-style check passes on that failure,
+# which is how it survived several builds and several boots.
+#
+# So: resolve each name the way the live shell will, through the PATH
+# copper-init sets, in that order, with no fallback and no confstr. If the two
+# ever drift apart, the build says so instead of a user finding out.
+assert_commands_reachable() {
+  # Must match setenv("PATH", ...) in copper-init.c. Keeping the two in step
+  # by hand is exactly the kind of thing that drifts, so if this fires, check
+  # that line first.
+  local copper_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  local applet d found target cand missing=""
   for applet in \
       sh ls cat cp mv rm mkdir touch chmod chown \
       grep sed awk cut tr sort uniq wc head tail \
@@ -478,92 +536,54 @@ assert_applets_work() {
       ip ifconfig route ping wget nslookup \
       mount umount switch_root \
       vi ; do
-    # The test that matters is not "--help works" -- several applets reject
-    # that -- it is whether the name resolves to something the kernel can
-    # actually exec, which is what the live system will try to do.
-    #
-    # -e is the WRONG test here and using it hides the most important failure.
-    # A busybox applet link is a relative symlink ("ip -> busybox") whose target
-    # lives in ../bin, so when we look for it inside sbin/ the target is not
-    # resolvable from that path, -e is false, and the applet reads as "not
-    # installed" -- or worse, a different entry is found and the broken one is
-    # never examined. Use -L first so a link is accepted as installed, then
-    # resolve it and insist the resolution lands on real content.
-    local found="" cand
-    local d
-    for d in "$TGT/bin" "$TGT/usr/bin" "$TGT/sbin" "$TGT/usr/sbin"; do
-      cand="$d/$applet"
+
+    found=""
+    # Walk PATH in the real order, first hit wins, exactly like execvp.
+    local oldifs="$IFS"
+    IFS=:
+    for d in $copper_path; do
+      IFS="$oldifs"
+      if [ "$d" = "/" ]; then cand="$TGT$applet"; else cand="$TGT$d/$applet"; fi
+      # -L first: a busybox applet link resolves relative to its own directory,
+      # so -e alone reports "missing" for a perfectly good link.
       if [ -L "$cand" ] || [ -e "$cand" ]; then found="$cand"; break; fi
+      IFS=:
     done
+    IFS="$oldifs"
+
     if [ -z "$found" ]; then
-      echo "rootfs: required command '$applet' is not installed in bin, sbin, usr/bin or usr/sbin" >&2
-      exit 1
+      missing="$missing $applet"
+      continue
     fi
 
-    # A link is only good if it resolves to something with content.
-    local target="$found"
+    target="$found"
     [ -L "$found" ] && target=$(readlink -f "$found" 2>/dev/null || echo "$found")
-
     if [ ! -e "$target" ]; then
       echo "rootfs: '$applet' is a symlink to nowhere: $found -> $(readlink "$found")" >&2
-      echo "       execve() will fail and the shell will say 'command not found'" >&2
+      echo "       execve() cannot follow it, so the shell reports 'command not found'" >&2
       exit 1
     fi
-    # Present but empty is the failure we actually shipped 310 of.
     if [ -f "$target" ] && [ ! -s "$target" ]; then
       echo "rootfs: '$applet' resolves to an EMPTY file: $target" >&2
-      echo "       execve() cannot run an empty file, so this reads as 'command not found'" >&2
+      echo "       execve() cannot run an empty file" >&2
       exit 1
     fi
   done
-  echo "rootfs: all required commands resolve to real, non-empty files"
-}
 
-# ---------------------------------------------------------------
-# 6b. the staged tree must not contain zero-byte files
-# ---------------------------------------------------------------
-# This exists because it was needed. A busybox applet symlink that a later
-# stage overwrote left a 0-byte file behind, and 310 of them shipped that way:
-# /sbin/ip, /sbin/ifconfig, /usr/bin/touch and most of the rest were all empty.
-# On the booted system execve() finds the empty file and fails, so the shell
-# reports "ip: command not found" for a command that is compiled in and
-# present. Nothing else in the build notices, because every check that exists
-# asks whether a file is *there*, and an empty file is very much there.
-#
-# An empty file is legitimate in a few known places, so they are listed rather
-# than allowing a blanket exemption.
-assert_no_empty_files() {
-  # A file that exists and has no content, excluding the ones we know are meant
-  # to be that way.
-  local empties skip
-  empties=$( cd "$TGT" && find . -type f -size 0 \
-    ! -path './etc/motd' \
-    ! -path './etc/hostname' \
-    ! -path './etc/timezone' \
-    ! -path './var/log/*' \
-    ! -name '*.uuid' \
-    -print 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort )
-
-  if [ -z "$empties" ]; then
-    echo "rootfs: no zero-byte files, good"
-    return 0
+  if [ -n "$missing" ]; then
+    {
+      echo "rootfs: these commands would answer 'command not found' on a live shell."
+      echo "        They are not on PATH=$copper_path"
+      echo
+      for a in $missing; do echo "          $a" >&2; done
+      echo
+      echo "        Either the applet is genuinely missing from the image, or"
+      echo "        copper-init's setenv("PATH", ...) no longer matches the list"
+      echo "        checked here. Those two must stay identical."
+    } >&2
+    exit 1
   fi
-
-  local n
-  n=$(printf '%s\n' "$empties" | wc -l)
-  {
-    echo "rootfs: $n zero-byte file(s) in the staged tree."
-    echo "These ship as broken commands: the file is present, so every"
-    echo "existence check passes, but execve() cannot run an empty file."
-    echo
-    printf '%s\n' "$empties" | head -25
-    [ "$n" -gt 25 ] && echo "  ... and $((n - 25)) more"
-    echo
-    echo "Usual cause: a symlink was overwritten without"
-    echo "--remove-destination, so the copy wrote through the link and"
-    echo "produced an empty file. Check which stage wrote each path above."
-  } >&2
-  exit 1
+  echo "rootfs: every required command is reachable by name on PATH"
 }
 
 # ---------------------------------------------------------------

@@ -71,6 +71,32 @@ static int valid_tz(const char *z) {
     return 1;   /* bare zones (UTC) and paths (America/New_York) both OK */
 }
 
+/* /etc/passwd, /etc/group and /etc/shadow all ship WITHOUT a trailing newline.
+
+   Appending to a file that does not end in one does not begin a new line, it
+   concatenates onto the last record. So writing the new account produced
+
+       nobody:x:65534:65534:nobody:/nonexistent:/bin/falsedragon:x:1000:...
+
+   which is one unparseable line instead of two records. busybox then refused
+   to read the file at all ("addgroup: /etc/passwd: bad record", once per
+   supplementary group), and the account that had just been created was not
+   readable by anything.
+
+   The cost of fixing it is one byte per file. The alternative is an account
+   that exists on disk and does not work, which is exactly what happened. */
+static void ensure_trailing_newline(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    if (fseek(f, -1, SEEK_END) == 0 && fgetc(f) != '\n') {
+        fclose(f);
+        FILE *w = fopen(path, "a");
+        if (w) { fputc('\n', w); fclose(w); }
+        return;
+    }
+    fclose(f);
+}
+
 /* Create the account by editing /etc/passwd, /etc/group and /etc/shadow
    directly.
 
@@ -83,6 +109,13 @@ static int valid_tz(const char *z) {
 
    Returns 0 on success. */
 static int create_user_direct(const char *user) {
+    /* Before anything is appended. See ensure_trailing_newline() above: an
+       append to a file with no trailing newline silently corrupts the last
+       record instead of adding a new one. */
+    ensure_trailing_newline("/etc/passwd");
+    ensure_trailing_newline("/etc/group");
+    ensure_trailing_newline("/etc/shadow");
+
     /* Already there? Then this is a re-run and the account is fine. */
     FILE *chk = fopen("/etc/passwd", "r");
     if (chk) {
@@ -254,6 +287,52 @@ static int run(const char *fmt, ...) {
     return system(cmd);
 }
 
+/* Run a command and throw away what it says.
+
+   The wizard is not a build log. busybox prints a warning for things that are
+   entirely normal here -- no /etc/adduser.conf, a group that already exists --
+   and six lines of that landing in the middle of a password prompt is what
+   made the first boot look like it was asking the same question over and
+   over. It was not; it was printing warnings underneath it. */
+static int run_quiet(const char *fmt, ...) {
+    char cmd[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cmd, sizeof cmd, fmt, ap);
+    va_end(ap);
+    char quiet[1200];
+    snprintf(quiet, sizeof quiet, "%s >/dev/null 2>&1", cmd);
+    return system(quiet);
+}
+
+/* Run a command but KEEP what it said, so that if it fails the reason can be
+   shown instead of being swallowed. Silence on success, diagnostics on
+   failure -- the opposite trade-off to run_quiet().
+
+   `fmt` has to be the LAST named parameter: va_start's second argument must be
+   the last named parameter of the variadic function, or the va_list is set up
+   from the wrong place and every argument after it is garbage. */
+static int run_capture(char *out, size_t cap, const char *fmt, ...) {
+    char cmd[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cmd, sizeof cmd, fmt, ap);
+    va_end(ap);
+
+    char wrapped[1200];
+    snprintf(wrapped, sizeof wrapped, "%s 2>&1", cmd);
+
+    out[0] = '\0';
+    FILE *p = popen(wrapped, "r");
+    if (!p) return -1;
+
+    size_t n = fread(out, 1, cap - 1, p);
+    out[n] = '\0';
+    int rc = pclose(p);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = '\0';
+    return rc;
+}
+
 static void set_password(const char *user, const char *pw) {
     char line[1024];
     snprintf(line, sizeof line, "%s:%s\n", user, pw);
@@ -324,33 +403,39 @@ int main(void) {
 
     /* The named user, with copper-sh as their login shell.
 
-       Two flags are load-bearing here, and omitting either one makes account
-       creation fail on this busybox:
+       Three things about this command, all of them found by running it against
+       the busybox that actually ships in the ISO rather than by reading docs:
 
-       -D   Without it, adduser tries to set a password and calls into PAM,
-            which is not in this image. It dies with
-            "passwd: pam_start() failed, error 26" and returns 10. The wizard
-            sets passwords itself further down via chpasswd, so asking adduser
-            to do it is both redundant and fatal.
+       -G <own group>   The group must already exist. Without it adduser fails
+            with "adduser: unknown group dragon" and creates nothing. So the
+            group goes in first, one line above. Omitting -G entirely does not
+            help: busybox then tries to create a group of the same name itself
+            and reports "adduser: group 'dragon' in use".
 
-       -G <own group>   Without it, adduser passes an EMPTY group name down to
-            groupadd and the whole thing aborts with
-            "groupadd: '' is not a valid group name" /
-            "fatal: `/sbin/groupadd -g 1000 ' returned error code 3".
-            This was the actual cause of "Couldn't create user" on a booted
-            system, and it reproduced exactly against the busybox shipped in
-            the ISO.
+       --disabled-password  Not -D. On this busybox -D is AMBIGUOUS between
+            --debug, --disabled-login and --disabled-password, so the short
+            form is rejected with "Option d is ambiguous" and adduser prints
+            its usage and exits without creating the account. The long option
+            is unambiguous and does what the wizard wants: the wizard sets both
+            passwords itself with chpasswd a few lines further down.
 
-       Note this busybox is the one built by iso/build.sh, not the host's, so
-       the failure only ever shows up on a real boot.
+       -s /usr/bin/copper-sh   The login shell. Nothing logs in yet -- init
+            goes straight to a shell -- but it is what makes the account a
+            Copper account rather than a generic one.
 
        If it still fails, fall through to writing /etc/passwd by hand rather
        than aborting the boot. A machine with a root account and no named user
        is a broken machine; one with slightly hand-written account files is
        merely unusual. */
-    if (run("/bin/busybox adduser -D -G %s -h /home/%s -s /usr/bin/copper-sh %s",
-            user, user, user) != 0) {
+    run_quiet("/bin/busybox addgroup %s", user);
+
+    char why[1024] = "";
+    if (run_capture(why, sizeof why,
+                    "/bin/busybox adduser --disabled-password -G %s "
+                    "-h /home/%s -s /usr/bin/copper-sh %s",
+                    user, user, user) != 0) {
         printf("(adduser failed, writing the account files directly)\n");
+        if (why[0]) printf("  busybox said: %s\n", why);
         if (create_user_direct(user) != 0) {
             printf("Couldn't create user %s.\n", user);
             return 1;
@@ -359,8 +444,11 @@ int main(void) {
     const char *supp[] = {"users", "audio", "video", "dialout", "cdrom", NULL};
     for (const char **g = supp; *g; g++) {
         /* A missing supplementary group is not worth aborting the boot for --
-           the account itself already exists and works. */
-        run("/bin/busybox addgroup %s %s", user, *g);
+           the account itself already exists and works. And the output is
+           suppressed: on a no-newline /etc/group every one of these printed a
+           "bad record" complaint, which is what filled the screen with noise
+           in the middle of the password question. */
+        run_quiet("/bin/busybox addgroup %s %s", user, *g);
     }
     read_password("Password (for you): ", userpw, sizeof userpw,
                   "Confirm your password: ");
@@ -379,11 +467,23 @@ int main(void) {
         }
     }
 
-    /* done marker */
+    /* done marker
+
+       Line 1 is the LOGIN NAME, not the display name, and that ordering is
+       load-bearing: copper-init reads line 1 and does
+
+           chdir("/home/<line 1>")
+
+       to decide where the shell starts. While this file held the display name,
+       a person who typed "Jane Doe" as their name and "jane" as their username
+       was sent to /home/Jane Doe, which does not exist -- init printed "no
+       home directory" and dropped them in / instead.
+
+       Line 2 is the display name, for anything that wants to greet them. */
     {
         FILE *m = fopen("/etc/copper-firstboot.done", "w");
         if (m) {
-            fprintf(m, "%s\n", name);
+            fprintf(m, "%s\n%s\n", user, name);
             fclose(m);
         }
     }

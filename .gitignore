@@ -2,3 +2,11 @@
 copper-sh
 iso/work/
 iso/out/iso-artifact*/
+
+# Downloaded ISOs, extracted from CI artifacts. These land at the repo root
+# because `gh run download --dir` is given a plain name, so the pattern above
+# never matched them and a careless `git add -A` would commit 60 MB of
+# unreproducible binary per attempt.
+iso-artifact*/
+iso-main-latest/
+build.sh.bak

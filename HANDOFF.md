@@ -121,124 +121,141 @@ from artifacts that were taken apart and read before being trusted.
    yet proved that a name resolves or that a TCP connection completes.
    `ping 1.1.1.1` and a `wget` are still unrun.
 
-## The 310 empty files
-
-The most expensive bug in this project's history, and the one whose diagnosis
-went wrong three times before it was right. Worth reading, because the wrong
-answers were all plausible.
+## "ip: command not found" — the cause, and three wrong answers first
 
 **The symptom.** A booted system reported `ip: command not found` and
-`ifconfig: command not found`. Both are compiled into the busybox that ships
-in the image — verified by running `busybox ip -V` on the extracted binary.
+`ifconfig: command not found`.
 
-**The truth.** 310 files in the ISO were **zero bytes**. `sbin/ip`,
-`sbin/ifconfig`, `usr/bin/awk`, `mach_kernel` and most of the rest. An empty
-file is present, so every existence check in the build passed, and `execve()`
-cannot run one, so the shell reported "command not found" for commands that
-were shipped and compiled in.
+**The cause.** PID 1 started with an environment the kernel builds, and that
+environment has no `PATH` in it. When a program has no `PATH`, `execvp()` falls
+back to `confstr(_CS_PATH)` — the kernel's compiled-in default:
 
-**Two wrong diagnoses, both mine, both retracted:**
+```
+/bin:/usr/bin
+```
 
-- *"There is a `/sbin` collision."* There is not. The empties are spread
-  across `usr/bin` (112), `usr/share` (66), `usr/sbin` (60) and `sbin` (70).
-  `sbin` is not special. I asserted this while looking at a `sbin`-only
+Copper installs its networking applets in `sbin`. So `/sbin` was never searched.
+`ip`, `ifconfig`, `route` and `arp` were present, compiled in (the shipped
+busybox is 2,464,864 bytes and lists 401 applets) and correctly symlinked the
+entire time. The shell simply was never told to look there. `ping`, `grep` and
+`touch` worked because they are in `/bin` and `/usr/bin`.
+
+Setting `PATH` inside `start_dhcp()` did not help, because that runs in a forked
+child: the child got a `PATH` and the shell — the thing people actually type at
+— did not. It is now set once in `main()`, before anything forks.
+
+**Three wrong diagnoses, all mine, all retracted. Read these anyway, because
+each one was a measurement artifact that looked exactly like a real bug.**
+
+- *"310 files in the ISO are zero bytes."* **False.** `sbin/ip` and friends are
+  symlinks, and ISO9660 records a symlink's size as 0 because the target is
+  stored as metadata, not content. Mounted read-only, the image has **671
+  symlinks and 2 zero-byte regular files** (`mach_kernel`, a vestigial
+  cosmopolitan artifact that `grub.cfg` never boots, and a `.disk/*.uuid`).
+- *"There is a `/sbin` collision."* There is not. That came from a `sbin`-only
   listing.
-- *"Files are owned by a user called `draon`, who should not exist."*
-  `draon` was **me** — the WSL account extracting the ISO. ISO9660 has no
-  per-file owner field, so p7zip stamps whoever ran the extraction. I built an
-  entire theory, and nearly a fix, on my own measurement artifact. The WSL
-  account has since been renamed to `dragon` so this cannot recur.
+- *"Files are owned by a user called `draon`, who should not exist."* `draon`
+  was me — the WSL account doing the extraction. ISO9660 has no per-file owner,
+  so p7zip stamps whoever extracted it. The WSL account is now `dragon`.
 
-**The pattern that actually identifies it:**
+**The lesson worth keeping: never inspect this ISO with p7zip.** `7z l` reports
+the symlinks correctly (`Mode = lr-xr-xr-x`, `Symbolic Link = ../bin/busybox`),
+but `7z x` writes *some* of them to disk as 0-byte regular files — `bin/touch`
+comes out as a symlink, `sbin/ip` comes out as a regular file, from the same
+image. Use `mount -o loop` or `bsdtar`. This cost two full build-and-boot cycles
+and produced a fix aimed at a bug that did not exist.
 
-```
-bin/     empty: 0    symlinks: 92     <- pure busybox, untouched
-usr/bin  empty: 112  symlinks: 15     <- damaged
-usr/sbin empty: 60   symlinks: ?      <- damaged
-sbin     empty: 70   symlinks: 1      <- damaged
-```
+### The gate that replaces it
 
-`bin/` is intact because nothing overwrote it. Every damaged directory is one
-where a later stage installed over busybox's applet links.
+`assert_commands_reachable` resolves every command a person actually types the
+way the live shell will: walking `PATH` in order, first hit wins, no confstr
+fallback. It rejects a name missing from `PATH`, a link that resolves to nowhere,
+and a link that resolves to an empty file. The `PATH` it checks is the same
+string `copper-init` sets, and if those two ever drift the build says so.
 
-**The fix, and why it is not the fix I first thought.** `cp` follows a symlink
-at the destination and writes *through* it. Adding `--remove-destination`
-everywhere is correct and necessary — but note what it does *not* explain.
-Tested directly, plain `cp` over a dangling applet link refuses:
+Verified against deliberately broken trees: good tree passes; `ip` deleted
+fails; `ifconfig` dangling fails; busybox truncated to 0 bytes fails; and the
+PATH string narrowed to drop `/sbin` fails — which is the regression that
+matters, and which every existence-style check passes.
 
-```
-cp: not writing through dangling symlink 'dest/ip'
-```
+`assert_no_empty_files` also remains, but narrowed and with its story corrected:
+`find -type f` does not match symlinks, so it ignores all 600-odd applet links
+and looks only at real files.
 
-It errors rather than producing an empty file. So `--remove-destination` is
-defence in depth, and the actual producer of the empty files is still not
-fully explained. **Treat the cause as unconfirmed.** What *is* confirmed is
-that the build now refuses to ship the symptom.
+## Account creation: four faults, found by running it
 
-**Two gates, both tested against a deliberately broken tree:**
+`Couldn't create user` went through four distinct causes. All four reproduce
+only against **the busybox that ships in the ISO** — a mount namespace with a
+private `/etc` is required, because busybox `adduser` hardcodes `/etc/passwd` and
+running it on WSL rewrites WSL's real accounts. Reproduce it by driving the real
+wizard through a pty; piping answers takes a different code path.
 
-- `assert_no_empty_files` — any 0-byte file in `$TGT` fails the build, minus a
-  short allowlist (`/etc/motd`, `/etc/hostname`, `/etc/timezone`, `/var/log/*`,
-  `*.uuid`).
-- `assert_applets_work` — every command a person actually types must resolve,
-  through `bin`, `sbin`, `usr/bin`, `usr/sbin`, to a **non-empty** file. This
-  one is subtle and the subtlety was found by testing it: the obvious `-e` test
-  is wrong, because a busybox applet link is relative (`ip -> busybox` with the
-  target in `../bin`), so `-e` is false when resolving it from `sbin/` and the
-  check silently skips precisely the links that matter. It now tests `-L` first
-  and then resolves with `readlink -f`, and separately rejects both empty
-  targets and links to nowhere.
+1. **`-G <group>` needs the group to exist first.** Otherwise
+   `adduser: unknown group dragon`, and nothing is created. Omitting `-G` does
+   not help — busybox then tries to create a group of the same name itself and
+   reports `adduser: group 'dragon' in use`. So: `addgroup <user>` first.
+2. **`-D` is ambiguous on this busybox** — `--debug`, `--disabled-login` and
+   `--disabled-password` all claim it. `adduser -D …` answers `Option d is
+   ambiguous`, prints its usage, creates nothing, and exits 0. Use the long
+   option `--disabled-password`.
+3. **`/etc/passwd`, `/etc/group` and `/etc/shadow` all shipped without a
+   trailing newline.** Appending to a file that does not end in one does not
+   begin a line, it concatenates onto the last record, producing
+   `…:/bin/falsedragon:x:1000:…`. One unparseable line instead of two records,
+   and then busybox refuses to read the file at all: `addgroup: /etc/passwd: bad
+   record`, once per supplementary group. Fixed at source, and
+   `ensure_trailing_newline()` also guards at runtime.
+4. **busybox chatter.** With the group present it still prints `warn:
+   /etc/adduser.conf does not exist` and `fatal: addgroup with two arguments is
+   an unspecified operation` — the word "fatal", on a boot where nothing failed.
+   Six lines of that landed on top of the password prompt, which is what made
+   the wizard look like it was asking the same question over and over. It was
+   printing warnings underneath it. Output is now captured, shown only on
+   failure.
 
-Verified: healthy tree passes; an applet pointing at a 0-byte busybox fails; a
-missing applet fails; and the check correctly rejects the actual broken ISO
-above, naming `awk`.
+The wizard still writes `/etc/passwd`, `/etc/group` and `/etc/shadow` itself
+(`create_user_direct()`) if `adduser` fails for any reason, and the whole thing
+is covered by a pty test that asserts a clean run with parseable account files.
 
-## Account creation: the third cause
+## Landing in the user's home, and the name on the prompt
 
-`Couldn't create user` has now happened on three separate boots, each time
-from a different underlying fault, and the fix is deliberately layered.
+`copper-init` reads the **first line** of `/etc/copper-firstboot.done` after the
+wizard has run, `chdir`s to `/home/<user>`, and sets `HOME`, `USER`, `LOGNAME`.
 
-Reproduced against **the busybox that ships in the ISO**, in a mount namespace
-with a private `/etc` (busybox `adduser` hardcodes `/etc/passwd`; running it
-directly on WSL rewrites WSL's real accounts, which has happened in this
-project before):
+**Line 1 is the login name, and that ordering is load-bearing.** The marker used
+to hold the *display* name, so anyone who typed "Jane Doe" as their name and
+"jane" as their username was sent to `/home/Jane Doe`, which does not exist —
+init printed "no home directory" and dropped them in `/`. Line 1 is now the
+username; line 2 is the display name.
 
-```
-groupadd: '' is not a valid group name
-fatal: `/sbin/groupadd -g 1000 ' returned error code 3. Exiting.
-rc=10
-```
+**The prompt reads the same marker**, because the shell genuinely does run as
+root: `copper-init` execs it directly, there is no `su` and no login, so
+`getpwuid(getuid())` is `root`. That is why the prompt said `root@copper` on a
+machine that had just announced "Done — welcome, dragon".
 
-Two distinct faults in one command:
+Worth being plain about: none of this is a security boundary. There is no login
+in front of the shell, so anyone at the console is uid 0 whatever the working
+directory or the prompt says.
 
-- **Without `-D`**, busybox `adduser` tries to set a password and calls into
-  PAM, which is not in the image: `passwd: pam_start() failed, error 26`.
-- **Without `-G <group>`**, it passes an *empty* group name to `groupadd` and
-  aborts.
+## Tilde expansion
 
-Neither reproduces on a normal Linux box with a normal `adduser`, which is
-why this only ever appears on a real Copper boot. The command is now
-`adduser -D -G <user> -h /home/<user> -s /usr/bin/copper-sh <user>`.
+`touch test.txt ~/test` answered `~/test: No such file or directory` — `~` was
+never expanded anywhere. `tokenize_line()` now expands a leading `~` (and
+`~user`, via `getpwnam`) on unquoted words only.
 
-**And if that still fails, the wizard writes `/etc/passwd`, `/etc/group` and
-`/etc/shadow` itself** (`create_user_direct()`), creating the home directory,
-populating it from `/etc/skel`, and starting the account with a locked
-password before `set_password()` fills it in. A box with a root account and no
-named user is broken; one with hand-written account files is merely unusual.
-Three boots lost to this is enough.
+Tokens are written into a **separate output buffer**, because expansion makes
+text longer: `~/test` is six characters and `/home/dragon/test` is sixteen, so
+writing in place would run past the end of the line buffer. The tokenizer is
+unit-tested directly by `#include`-ing `main.c` with `main` renamed, so the test
+cannot drift from the code that ships.
 
-## Landing in the user's home
+Two bugs the tests caught that reading would not have:
 
-Previously the shell started in `/`. `copper-init` now reads the username from
-the first line of `/etc/copper-firstboot.done` **after** the wizard has run
-(reading it before finds nothing on a first boot), and `chdir`s to
-`/home/<user>`, setting `HOME`, `USER` and `LOGNAME` to match. If the home is
-missing or unreachable it says so and stays in `/` rather than pretending.
+- the user-name scan stopped only at `/`, so `echo ~ /tmp` looked up a user
+  literally named `" "` and left the `~` unexpanded;
+- `#` started a comment mid-word, so `echo x#y` printed `x`.
 
-Worth being plain about: this does not make the system safe. There is no login
-in front of the shell — init goes straight to a root shell — so anyone at the
-console is uid 0 regardless of the working directory. It is a small piece of
-correct behaviour, not a security boundary.
+It also refuses an expansion that will not fit rather than overflowing.
 
 ---
 
