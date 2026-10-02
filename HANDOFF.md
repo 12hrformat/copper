@@ -111,15 +111,134 @@ from artifacts that were taken apart and read before being trusted.
 ## What has never run
 
 1. **A complete, clean first-boot wizard run.** The wizard now reaches every
-   question and, as of `22ffde5`, creates the account correctly. But nobody
-   has yet seen one boot go banner → all questions → `Done — welcome` → a
-   `dragon@copper` prompt. Each stage was fixed and confirmed individually;
+   question and creates the account by two independent paths (see below), but
+   nobody has yet seen one boot go banner → all questions → `Done — welcome` →
+   a `dragon@copper` prompt. Each stage was fixed and confirmed individually;
    the whole path has not been confirmed in a single pass.
 2. **`copper charge` on a booted system.** The logic is verified end to end
    off-ISO (see below) but has never run against a live root.
-3. **Real internet traffic.** We have an address, a prefix, a default route
-   and a nameserver. Nothing has yet proved that a name resolves or that a TCP
-   connection completes. `ping 1.1.1.1` and a `wget` are still unrun.
+3. **Real internet traffic.** `ping` to a host on the LAN works. Nothing has
+   yet proved that a name resolves or that a TCP connection completes.
+   `ping 1.1.1.1` and a `wget` are still unrun.
+
+## The 310 empty files
+
+The most expensive bug in this project's history, and the one whose diagnosis
+went wrong three times before it was right. Worth reading, because the wrong
+answers were all plausible.
+
+**The symptom.** A booted system reported `ip: command not found` and
+`ifconfig: command not found`. Both are compiled into the busybox that ships
+in the image — verified by running `busybox ip -V` on the extracted binary.
+
+**The truth.** 310 files in the ISO were **zero bytes**. `sbin/ip`,
+`sbin/ifconfig`, `usr/bin/awk`, `mach_kernel` and most of the rest. An empty
+file is present, so every existence check in the build passed, and `execve()`
+cannot run one, so the shell reported "command not found" for commands that
+were shipped and compiled in.
+
+**Two wrong diagnoses, both mine, both retracted:**
+
+- *"There is a `/sbin` collision."* There is not. The empties are spread
+  across `usr/bin` (112), `usr/share` (66), `usr/sbin` (60) and `sbin` (70).
+  `sbin` is not special. I asserted this while looking at a `sbin`-only
+  listing.
+- *"Files are owned by a user called `draon`, who should not exist."*
+  `draon` was **me** — the WSL account extracting the ISO. ISO9660 has no
+  per-file owner field, so p7zip stamps whoever ran the extraction. I built an
+  entire theory, and nearly a fix, on my own measurement artifact. The WSL
+  account has since been renamed to `dragon` so this cannot recur.
+
+**The pattern that actually identifies it:**
+
+```
+bin/     empty: 0    symlinks: 92     <- pure busybox, untouched
+usr/bin  empty: 112  symlinks: 15     <- damaged
+usr/sbin empty: 60   symlinks: ?      <- damaged
+sbin     empty: 70   symlinks: 1      <- damaged
+```
+
+`bin/` is intact because nothing overwrote it. Every damaged directory is one
+where a later stage installed over busybox's applet links.
+
+**The fix, and why it is not the fix I first thought.** `cp` follows a symlink
+at the destination and writes *through* it. Adding `--remove-destination`
+everywhere is correct and necessary — but note what it does *not* explain.
+Tested directly, plain `cp` over a dangling applet link refuses:
+
+```
+cp: not writing through dangling symlink 'dest/ip'
+```
+
+It errors rather than producing an empty file. So `--remove-destination` is
+defence in depth, and the actual producer of the empty files is still not
+fully explained. **Treat the cause as unconfirmed.** What *is* confirmed is
+that the build now refuses to ship the symptom.
+
+**Two gates, both tested against a deliberately broken tree:**
+
+- `assert_no_empty_files` — any 0-byte file in `$TGT` fails the build, minus a
+  short allowlist (`/etc/motd`, `/etc/hostname`, `/etc/timezone`, `/var/log/*`,
+  `*.uuid`).
+- `assert_applets_work` — every command a person actually types must resolve,
+  through `bin`, `sbin`, `usr/bin`, `usr/sbin`, to a **non-empty** file. This
+  one is subtle and the subtlety was found by testing it: the obvious `-e` test
+  is wrong, because a busybox applet link is relative (`ip -> busybox` with the
+  target in `../bin`), so `-e` is false when resolving it from `sbin/` and the
+  check silently skips precisely the links that matter. It now tests `-L` first
+  and then resolves with `readlink -f`, and separately rejects both empty
+  targets and links to nowhere.
+
+Verified: healthy tree passes; an applet pointing at a 0-byte busybox fails; a
+missing applet fails; and the check correctly rejects the actual broken ISO
+above, naming `awk`.
+
+## Account creation: the third cause
+
+`Couldn't create user` has now happened on three separate boots, each time
+from a different underlying fault, and the fix is deliberately layered.
+
+Reproduced against **the busybox that ships in the ISO**, in a mount namespace
+with a private `/etc` (busybox `adduser` hardcodes `/etc/passwd`; running it
+directly on WSL rewrites WSL's real accounts, which has happened in this
+project before):
+
+```
+groupadd: '' is not a valid group name
+fatal: `/sbin/groupadd -g 1000 ' returned error code 3. Exiting.
+rc=10
+```
+
+Two distinct faults in one command:
+
+- **Without `-D`**, busybox `adduser` tries to set a password and calls into
+  PAM, which is not in the image: `passwd: pam_start() failed, error 26`.
+- **Without `-G <group>`**, it passes an *empty* group name to `groupadd` and
+  aborts.
+
+Neither reproduces on a normal Linux box with a normal `adduser`, which is
+why this only ever appears on a real Copper boot. The command is now
+`adduser -D -G <user> -h /home/<user> -s /usr/bin/copper-sh <user>`.
+
+**And if that still fails, the wizard writes `/etc/passwd`, `/etc/group` and
+`/etc/shadow` itself** (`create_user_direct()`), creating the home directory,
+populating it from `/etc/skel`, and starting the account with a locked
+password before `set_password()` fills it in. A box with a root account and no
+named user is broken; one with hand-written account files is merely unusual.
+Three boots lost to this is enough.
+
+## Landing in the user's home
+
+Previously the shell started in `/`. `copper-init` now reads the username from
+the first line of `/etc/copper-firstboot.done` **after** the wizard has run
+(reading it before finds nothing on a first boot), and `chdir`s to
+`/home/<user>`, setting `HOME`, `USER` and `LOGNAME` to match. If the home is
+missing or unreachable it says so and stays in `/` rather than pretending.
+
+Worth being plain about: this does not make the system safe. There is no login
+in front of the shell — init goes straight to a root shell — so anyone at the
+console is uid 0 regardless of the working directory. It is a small piece of
+correct behaviour, not a security boundary.
 
 ---
 

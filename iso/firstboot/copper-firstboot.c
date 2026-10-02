@@ -15,10 +15,14 @@
 #define _GNU_SOURCE
 
 #include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 static void banner(void) {
@@ -65,6 +69,137 @@ static int valid_tz(const char *z) {
               *p == '+' || *p == '/'))
             return 0;
     return 1;   /* bare zones (UTC) and paths (America/New_York) both OK */
+}
+
+/* Create the account by editing /etc/passwd, /etc/group and /etc/shadow
+   directly.
+
+   This exists because busybox adduser has now broken account creation on a
+   booted system twice, in two different ways that only reproduce against this
+   exact build's busybox (it calls PAM and groupadd, neither of which is in the
+   image). /etc/passwd is a colon-separated file and we already know its exact
+   format -- it is ours. Writing three lines is less clever than calling a
+   helper, and it is a helper that has repeatedly not worked.
+
+   Returns 0 on success. */
+static int create_user_direct(const char *user) {
+    /* Already there? Then this is a re-run and the account is fine. */
+    FILE *chk = fopen("/etc/passwd", "r");
+    if (chk) {
+        char line[512];
+        while (fgets(line, sizeof line, chk)) {
+            if (strncmp(line, user, strlen(user)) == 0 && line[strlen(user)] == ':') {
+                fclose(chk);
+                return 0;      /* present already, not a failure */
+            }
+        }
+        fclose(chk);
+    }
+
+    /* Find an unused uid by scanning the passwd file for the numeric ids. */
+    int uid = 1000;
+    FILE *p = fopen("/etc/passwd", "r");
+    if (p) {
+        char line[512];
+        int used[65536];
+        memset(used, 0, sizeof used);
+        while (fgets(line, sizeof line, p)) {
+            char *c1 = strchr(line, ':');
+            if (!c1) continue;
+            int v = atoi(c1 + 1);
+            if (v > 0 && v < 65536) used[v] = 1;
+        }
+        fclose(p);
+        while (uid < 65535 && used[uid]) uid++;
+    }
+
+    char home[128], gecos[256];
+    snprintf(home, sizeof home, "/home/%s", user);
+    snprintf(gecos, sizeof gecos, "%s", user);
+
+    /* group: same name and id as the user, which is the convention adduser
+       follows when no primary group is named. */
+    int have_group = 0;
+    FILE *g = fopen("/etc/group", "r");
+    if (g) {
+        char line[512];
+        while (fgets(line, sizeof line, g))
+            if (strncmp(line, user, strlen(user)) == 0 && line[strlen(user)] == ':') {
+                have_group = 1; break;
+            }
+        fclose(g);
+    }
+    if (!have_group) {
+        g = fopen("/etc/group", "a");
+        if (g) { fprintf(g, "%s:x:%d:\n", user, uid); fclose(g); }
+    }
+
+    p = fopen("/etc/passwd", "a");
+    if (!p) return 1;
+    fprintf(p, "%s:x:%d:%d:%s:%s:/usr/bin/copper-sh\n",
+            user, uid, uid, gecos, home);
+    fclose(p);
+
+    /* shadow: locked, no password. set_password() fills it in moments later;
+       starting locked means there is no window where the account has an empty
+       password and is reachable from a console. */
+    int have_shadow = 0;
+    FILE *s = fopen("/etc/shadow", "r");
+    if (s) {
+        char line[512];
+        while (fgets(line, sizeof line, s))
+            if (strncmp(line, user, strlen(user)) == 0 && line[strlen(user)] == ':') {
+                have_shadow = 1; break;
+            }
+        fclose(s);
+    }
+    if (!have_shadow) {
+        s = fopen("/etc/shadow", "a");
+        if (s) { fprintf(s, "%s:!::0:0:99999:7:::\n", user); fclose(s); }
+    }
+
+    /* home directory, owned by the new user */
+    if (mkdir(home, 0755) != 0 && errno != EEXIST) {
+        printf("(note: couldn't create %s)\n", home);
+    }
+    chown(home, uid, uid);
+
+    /* skel, so a new home is not an empty directory */
+    const char *skel = "/etc/skel";
+    if (access(skel, R_OK) == 0) {
+        /* copy regular files out of skel; no subdirs are shipped there */
+        DIR *d = opendir(skel);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                char from[512], to[512];
+                if (snprintf(from, sizeof from, "%s/%s", skel, de->d_name)
+                        >= (int)sizeof from) continue;
+                if (snprintf(to, sizeof to, "%s/%s", home, de->d_name)
+                        >= (int)sizeof to) continue;
+                struct stat st;
+                if (stat(from, &st) == 0 && S_ISREG(st.st_mode)) {
+                    /* ignore failures: a missing dotfile is not worth a boot */
+                    (void)remove(to);
+                    if (link(from, to) != 0) { /* hardlink, else copy */
+                        FILE *in = fopen(from, "r"), *out = fopen(to, "w");
+                        if (in && out) {
+                            char buf[4096]; size_t n;
+                            while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+                                fwrite(buf, 1, n, out);
+                        }
+                        if (in) fclose(in);
+                        if (out) fclose(out);
+                    }
+                    chown(to, uid, uid);
+                }
+            }
+            closedir(d);
+        }
+    }
+
+    return 0;
 }
 
 /* Ask for one password, twice, and insist the two match.
@@ -189,16 +324,37 @@ int main(void) {
 
     /* The named user, with copper-sh as their login shell.
 
-       Supplementary groups go in one at a time via addgroup. This busybox's
-       adduser takes exactly one group after -G: passing "users,audio,video"
-       makes it look up that entire string as a single group name and fail
-       with "unknown group users,audio,video", and -G users alone never
-       creates the group entry either. addgroup USER GROUP one at a time is
-       the form this build actually implements. */
-    if (run("/bin/busybox adduser -h /home/%s -s /usr/bin/copper-sh %s",
-            user, user) != 0) {
-        printf("Couldn't create user %s.\n", user);
-        return 1;
+       Two flags are load-bearing here, and omitting either one makes account
+       creation fail on this busybox:
+
+       -D   Without it, adduser tries to set a password and calls into PAM,
+            which is not in this image. It dies with
+            "passwd: pam_start() failed, error 26" and returns 10. The wizard
+            sets passwords itself further down via chpasswd, so asking adduser
+            to do it is both redundant and fatal.
+
+       -G <own group>   Without it, adduser passes an EMPTY group name down to
+            groupadd and the whole thing aborts with
+            "groupadd: '' is not a valid group name" /
+            "fatal: `/sbin/groupadd -g 1000 ' returned error code 3".
+            This was the actual cause of "Couldn't create user" on a booted
+            system, and it reproduced exactly against the busybox shipped in
+            the ISO.
+
+       Note this busybox is the one built by iso/build.sh, not the host's, so
+       the failure only ever shows up on a real boot.
+
+       If it still fails, fall through to writing /etc/passwd by hand rather
+       than aborting the boot. A machine with a root account and no named user
+       is a broken machine; one with slightly hand-written account files is
+       merely unusual. */
+    if (run("/bin/busybox adduser -D -G %s -h /home/%s -s /usr/bin/copper-sh %s",
+            user, user, user) != 0) {
+        printf("(adduser failed, writing the account files directly)\n");
+        if (create_user_direct(user) != 0) {
+            printf("Couldn't create user %s.\n", user);
+            return 1;
+        }
     }
     const char *supp[] = {"users", "audio", "video", "dialout", "cdrom", NULL};
     for (const char **g = supp; *g; g++) {

@@ -291,6 +291,45 @@ int main(void) {
         waitpid(wiz, &wst, 0);
     }
 
+    /* Land in the user's own home, not in /.
+
+       This has to happen after the wizard, not before: on a first boot the
+       done-marker does not exist yet, so reading it any earlier finds nothing.
+       /etc/copper-firstboot.done holds the username on its first line, written
+       by the wizard as it finishes.
+
+       Dropping someone at / is worth avoiding. That is uid 0 sitting next to
+       /boot, /etc and the block devices, with no login in front of it. This
+       does not make the system safe -- init goes straight to a root shell, and
+       pretending otherwise would be worse than saying so plainly -- but the
+       working directory should not be the root of the filesystem. */
+    {
+        char who[64] = "";
+        FILE *m = fopen("/etc/copper-firstboot.done", "r");
+        if (m) {
+            if (fgets(who, sizeof who, m)) {
+                char *nl = strchr(who, '\n');
+                if (nl) *nl = '\0';
+            }
+            fclose(m);
+        }
+        if (who[0]) {
+            char home[160];
+            snprintf(home, sizeof home, "/home/%s", who);
+            /* Only adopt it if it is a real, enterable directory: a stale
+               marker left by a half-finished wizard must not put us somewhere
+               that does not exist. */
+            if (access(home, X_OK) == 0 && chdir(home) == 0) {
+                setenv("HOME", home, 1);
+                setenv("USER", who, 1);
+                setenv("LOGNAME", who, 1);
+            } else {
+                printf("copper: no home directory at %s -- staying in /\n",
+                       home);
+            }
+        }
+    }
+
     /* Exactly one shell at a time. Keep the pid so the reaper below can wait on
        this specific child instead of on any child: udhcpc is our child too, and
        `udhcpc -b` leaves a short-lived parent behind when it daemonises.

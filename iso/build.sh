@@ -246,6 +246,7 @@ require_bb_config() {
       UDHCPC FEATURE_UDHCPC_ARPING IP IFCONFIG ROUTE PING \
       WGET FEATURE_WGET_HTTPS NSLOOKUP \
       MOUNT SWITCH_ROOT HOSTNAME \
+      VI FEATURE_VI_COLORS \
       ADDUSER ADDGROUP FEATURE_ADDUSER_TO_GROUP \
       CHPASSWD FEATURE_SHADOWPASSWDS ; do
     grep -qx "CONFIG_$sym=y" "$cfg" || missing="$missing $sym"
@@ -394,9 +395,18 @@ build_copper() {
 # ---------------------------------------------------------------
 build_rootfs() {
   echo "==> rootfs config"
-  cp -a "$ROOT/rootfs-overlay/." "$TGT/"
+  # --remove-destination everywhere we copy into the staged tree.
+  #
+  # Without it, `cp` follows an existing symlink at the destination and writes
+  # THROUGH it, and when the link pointed at a file that does not exist on this
+  # machine the copy silently produces a zero-byte file instead of the intended
+  # one. The staged tree is full of busybox applet symlinks, and later stages
+  # install real GNU binaries over the top of them, so this is the common case
+  # here rather than an edge case. It also means a stale entry can never
+  # survive as a link pointing at something outside the image.
+  cp -a --remove-destination "$ROOT/rootfs-overlay/." "$TGT/"
   mkdir -p "$TGT/usr/share/zoneinfo" "$TGT/etc/skel"
-  cp -a /usr/share/zoneinfo/. "$TGT/usr/share/zoneinfo/" 2>/dev/null \
+  cp -a --remove-destination /usr/share/zoneinfo/. "$TGT/usr/share/zoneinfo/" 2>/dev/null \
     || echo "  (no host zoneinfo to copy — timezone data will be missing)"
   # udhcpc execs this the moment a lease lands, and git does not reliably
   # carry the exec bit across platforms, so set it here.
@@ -434,6 +444,126 @@ build_rootfs() {
     done < <(comm -23 "$old" "$new")
   fi
   mv -f "$new" "$old"
+
+  assert_no_empty_files
+  assert_applets_work
+}
+
+# ---------------------------------------------------------------
+# 6c. the applets people actually type must be runnable
+# ---------------------------------------------------------------
+# -x is not enough. A zero-byte file is executable as far as the shell is
+# concerned, and so is a symlink pointing nowhere useful, but neither can be
+# run. This walks the list of commands a person reaches for in a Copper shell
+# and actually executes each one through the staged busybox, so a broken applet
+# is a build failure instead of a surprise on someone's first boot.
+#
+# This is here because 310 applets shipped as empty files and the only symptom
+# was "command not found" for commands that were present and compiled in.
+assert_applets_work() {
+  local BB="$TGT/bin/busybox"
+  [ -x "$BB" ] || { echo "rootfs: no busybox to test against" >&2; exit 1; }
+
+  # Chosen because they are what the wizard, the init scripts, the hotfix
+  # tools and an ordinary person at a prompt all reach for. If one of these is
+  # broken the system is visibly broken.
+  local applet
+  for applet in \
+      sh ls cat cp mv rm mkdir touch chmod chown \
+      grep sed awk cut tr sort uniq wc head tail \
+      date sleep env printf echo test true false \
+      ln mktemp find xargs basename dirname which \
+      id hostname uname ps kill df du \
+      adduser addgroup chpasswd \
+      ip ifconfig route ping wget nslookup \
+      mount umount switch_root \
+      vi ; do
+    # The test that matters is not "--help works" -- several applets reject
+    # that -- it is whether the name resolves to something the kernel can
+    # actually exec, which is what the live system will try to do.
+    #
+    # -e is the WRONG test here and using it hides the most important failure.
+    # A busybox applet link is a relative symlink ("ip -> busybox") whose target
+    # lives in ../bin, so when we look for it inside sbin/ the target is not
+    # resolvable from that path, -e is false, and the applet reads as "not
+    # installed" -- or worse, a different entry is found and the broken one is
+    # never examined. Use -L first so a link is accepted as installed, then
+    # resolve it and insist the resolution lands on real content.
+    local found="" cand
+    local d
+    for d in "$TGT/bin" "$TGT/usr/bin" "$TGT/sbin" "$TGT/usr/sbin"; do
+      cand="$d/$applet"
+      if [ -L "$cand" ] || [ -e "$cand" ]; then found="$cand"; break; fi
+    done
+    if [ -z "$found" ]; then
+      echo "rootfs: required command '$applet' is not installed in bin, sbin, usr/bin or usr/sbin" >&2
+      exit 1
+    fi
+
+    # A link is only good if it resolves to something with content.
+    local target="$found"
+    [ -L "$found" ] && target=$(readlink -f "$found" 2>/dev/null || echo "$found")
+
+    if [ ! -e "$target" ]; then
+      echo "rootfs: '$applet' is a symlink to nowhere: $found -> $(readlink "$found")" >&2
+      echo "       execve() will fail and the shell will say 'command not found'" >&2
+      exit 1
+    fi
+    # Present but empty is the failure we actually shipped 310 of.
+    if [ -f "$target" ] && [ ! -s "$target" ]; then
+      echo "rootfs: '$applet' resolves to an EMPTY file: $target" >&2
+      echo "       execve() cannot run an empty file, so this reads as 'command not found'" >&2
+      exit 1
+    fi
+  done
+  echo "rootfs: all required commands resolve to real, non-empty files"
+}
+
+# ---------------------------------------------------------------
+# 6b. the staged tree must not contain zero-byte files
+# ---------------------------------------------------------------
+# This exists because it was needed. A busybox applet symlink that a later
+# stage overwrote left a 0-byte file behind, and 310 of them shipped that way:
+# /sbin/ip, /sbin/ifconfig, /usr/bin/touch and most of the rest were all empty.
+# On the booted system execve() finds the empty file and fails, so the shell
+# reports "ip: command not found" for a command that is compiled in and
+# present. Nothing else in the build notices, because every check that exists
+# asks whether a file is *there*, and an empty file is very much there.
+#
+# An empty file is legitimate in a few known places, so they are listed rather
+# than allowing a blanket exemption.
+assert_no_empty_files() {
+  # A file that exists and has no content, excluding the ones we know are meant
+  # to be that way.
+  local empties skip
+  empties=$( cd "$TGT" && find . -type f -size 0 \
+    ! -path './etc/motd' \
+    ! -path './etc/hostname' \
+    ! -path './etc/timezone' \
+    ! -path './var/log/*' \
+    ! -name '*.uuid' \
+    -print 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort )
+
+  if [ -z "$empties" ]; then
+    echo "rootfs: no zero-byte files, good"
+    return 0
+  fi
+
+  local n
+  n=$(printf '%s\n' "$empties" | wc -l)
+  {
+    echo "rootfs: $n zero-byte file(s) in the staged tree."
+    echo "These ship as broken commands: the file is present, so every"
+    echo "existence check passes, but execve() cannot run an empty file."
+    echo
+    printf '%s\n' "$empties" | head -25
+    [ "$n" -gt 25 ] && echo "  ... and $((n - 25)) more"
+    echo
+    echo "Usual cause: a symlink was overwritten without"
+    echo "--remove-destination, so the copy wrote through the link and"
+    echo "produced an empty file. Check which stage wrote each path above."
+  } >&2
+  exit 1
 }
 
 # ---------------------------------------------------------------

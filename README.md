@@ -31,7 +31,9 @@ general daily use.
 | `copper-sh` (shell) | Works. Arrow-key line editing, history, pipes, redirects. |
 | Networking | Works — wired only. DHCP on boot, `ping`/`nslookup`/`wget` present. |
 | `copper charge` / `copper rollback` | Ship in the ISO. Logic tested end to end off-ISO; not yet run on a booted system. |
-| First-boot wizard | Boots and asks its questions. Account creation fixed, but a full clean run is still unconfirmed. |
+| First-boot wizard | Reaches every question. Account creation had three separate causes, all now fixed with a fallback; a full clean run is still unconfirmed. |
+| Shell starts in your home | Yes. Lands in `/home/<user>`, not `/`. |
+| Text editor | busybox `vi`. `nano` is not built — it needs ncurses. |
 | GUI | Not started — planned for later. |
 | Base system (kernel, musl, userland) | Building from source, CI green end to end. |
 | Bootable ISO | Builds successfully. Boots in a VM. |
