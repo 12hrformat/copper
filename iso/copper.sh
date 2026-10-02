@@ -1,6 +1,5 @@
 #!/bin/busybox sh
 # copper — Copper Linux system command.
-# handcrafted by 12hrformat
 #
 # A front end for the individual tools, so the commands people actually
 # want to type are short:

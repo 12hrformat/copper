@@ -1,6 +1,5 @@
 #!/bin/busybox sh
 # copper rollback — restore files from hotfix backups.
-# handcrafted by 12hrformat
 #
 # Lists available backups and restores them. If a hotfix breaks
 # something, this is how you undo it.

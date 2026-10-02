@@ -30,8 +30,8 @@ general daily use.
 |---|---|
 | `copper-sh` (shell) | Works. Arrow-key line editing, history, pipes, redirects. |
 | Networking | Works — wired only. DHCP on boot, `ping`/`nslookup`/`wget` present. |
-| `copper charge` / `copper rollback` | Ship in the ISO. Logic tested end to end off-ISO; not yet run on a booted system. |
-| First-boot wizard | Reaches every question. Account creation had three separate causes, all now fixed with a fallback; a full clean run is still unconfirmed. |
+| `copper charge` / `copper rollback` | Confirmed working on a booted system. |
+| First-boot wizard | Boot animation, then a centred table of questions, then the account. Boots to a `you@copper` prompt. |
 | Shell starts in your home | Yes. Lands in `/home/<user>`, not `/`. |
 | Text editor | busybox `vi`. `nano` is not built — it needs ncurses. |
 | GUI | Not started — planned for later. |
@@ -90,6 +90,79 @@ The live initramfs (`iso/live/init`) finds the boot medium and builds a
 writable overlay — read-only ISO root, tmpfs on top — before handing off
 to `copper-init`. That overlay is also the mechanism persistence will use
 once it's built out.
+
+---
+
+## copper-firstboot
+
+What you see the first time the ISO boots:
+
+1. **The shield**, drawn a line at a time at about 100ms per line. Press any
+   key to skip to the end of it.
+2. **The wordmark**, `COPPER LINUX`, centred. Held for a moment.
+3. **A table of questions**, centred, with a live status line underneath.
+   Every question is asked up front, then the answers are applied.
+
+```
++----------------------------------------------------------------+
+|   Copper Linux  -  first boot setup                            |
++----------------------------------------------------------------+
+|   Your name           Zaphod                                    |
+|   Username            zaphod                                    |
+|   Hostname            attic-box                                 |
+|   Root password      ********                                   |
+|   Your password      ********                                   |
+|   Timezone            UTC                                       |
++----------------------------------------------------------------+
+|What should Copper call you?                                     |
++----------------------------------------------------------------+
+```
+
+Each row shows the answer once there is one, and a hint until then — the
+hint is a default you get by pressing Enter, not text you have to clear.
+Typing overwrites it. Arrow keys, Backspace and Ctrl-U all work; passwords
+are echoed as `*` and asked for twice.
+
+The table is only used when the terminal is big enough for it and is a real
+terminal at all: at least 46 columns by 14 rows, and both stdin and stdout
+have to be a tty. Otherwise it falls back to one plain question at a time,
+with no animation and no escape sequences. That is deliberate — the VGA
+console is 80x25 but a serial console is whatever someone chose, and
+clearing someone's scrollback to show them a progress animation is rude.
+
+Box drawing is `+`, `-` and `|` only. The VGA console font has no box-drawing
+characters or em dashes, so anything prettier arrives as a row of blanks.
+
+### The art
+
+The shield and the wordmark are generated, not hand-typed into the source:
+
+```sh
+python3 tools/gen-boot-art.py     # writes iso/firstboot/boot-art.h
+```
+
+That matters more than it sounds. A single dropped `@` in a block of ASCII is
+invisible in a diff and turns the logo into a smudge, so the art has one
+source and one command that regenerates it.
+
+The wordmark is a compact 7-row 5x7 block font rather than the tall
+display one. The display cut is 22 rows by 194 columns, which cannot fit an
+80-column console — it wraps into nonsense — so the block font is what
+actually renders on a VGA terminal.
+
+### Answers are validated
+
+Everything that ends up in a shell command is checked before it is used.
+The hostname and the timezone both go into `system()` calls:
+
+```sh
+echo <hostname> > /etc/hostname
+ln -sf /usr/share/zoneinfo/<timezone> /etc/localtime
+```
+
+so an unvalidated answer would be shell, not a hostname. Every field has a
+validator and a rejection message, and the same rules apply on both the
+table and the plain path.
 
 ---
 
@@ -241,6 +314,8 @@ iso/live/init         live initramfs
 iso/boot/             GRUB config
 iso/src-init/         copper-init source
 iso/firstboot/        copper-firstboot source
+iso/firstboot/boot-art.h   generated shield + wordmark
+tools/gen-boot-art.py regenerates the art above
 iso/rootfs-overlay/   default /etc for the rootfs
 tests/smoke.sh        sanity checks
 Makefile
@@ -252,11 +327,13 @@ PR.md                 PR notes/template
 
 ## What's next
 
-- A confirmed clean first boot: wizard asks everything, creates the account,
-  drops to a `dragon@copper` prompt
-- `copper charge` run against a real booted system, not just off-ISO
-- WiFi, if we decide a VM-testable target is possible at all
+- Persistence — answers that survive a reboot rather than applying for the
+  live session only
+- `copper charge --update` to pull a newer hotfix database, and a hotfix
+  type that can create a file instead of editing an existing one
 - `copper charge --status` as a real dry run
+- Skipping the boot animation from the kernel command line
+- WiFi, if we decide a VM-testable target is possible at all
 - GUI — no timeline yet, comes after the base system is solid
 - `~/.copperrc` init file for the shell
 - Shell history persisted to disk

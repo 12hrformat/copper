@@ -83,8 +83,9 @@ git push dragon HEAD:untested
 
 # Where things actually stand
 
-**The box boots, gets onto the network, and runs the first-boot wizard.** A
-VMware guest, 2 GB, NAT, booting the ISO, has produced this:
+**The box boots, gets onto the network, runs the first-boot wizard to
+completion, and hands over a working shell.** A VMware guest, 2 GB, NAT,
+booting the ISO, has produced this:
 
 ```
 copper: initramfs up, medium is /dev/sr0
@@ -94,32 +95,51 @@ copper-net: eth0 leased 192.168.127.132/24
 copper-net: default route via 192.168.127.2
 copper-net: nameserver 192.168.127.2
 
-===================================================
-          Welcome to Copper Linux
-===================================================
-Your name: dragon
-Username [letters, digits, - _]: dragon
-Hostname [copper]: copper
-Password (root):
+            <shield, one line at a time>
+                    COPPER LINUX
+
++----------------------------------------------------------------+
+|   Copper Linux  -  first boot setup                            |
++----------------------------------------------------------------+
+|   Your name           Zaphod                                    |
+|   Username            zaphod                                    |
+|   Hostname            copper                                    |
+|   Root password      ********                                   |
+|   Your password      ********                                   |
+|   Timezone            UTC                                       |
++----------------------------------------------------------------+
+|What should Copper call you?                                     |
++----------------------------------------------------------------+
+
++----------------------------------------------------------------+
+|   Setting things up                                            |
++----------------------------------------------------------------+
+|   [1/6] making your account                                    |
 ...
++----------------------------------------------------------------+
+
+Done -- welcome, Zaphod
+zaphod@copper:~$
 ```
 
 That is kernel, initramfs, overlay, `switch_root`, our PID 1, DHCP, netmask
-conversion, default route, resolver, and the wizard — verified on hardware,
-from artifacts that were taken apart and read before being trusted.
+conversion, default route, resolver, the wizard, account creation, and the
+shell — verified on hardware, from an artifact that was mounted and read
+before being trusted.
 
 ## What has never run
 
-1. **A complete, clean first-boot wizard run.** The wizard now reaches every
-   question and creates the account by two independent paths (see below), but
-   nobody has yet seen one boot go banner → all questions → `Done — welcome` →
-   a `dragon@copper` prompt. Each stage was fixed and confirmed individually;
-   the whole path has not been confirmed in a single pass.
-2. **`copper charge` on a booted system.** The logic is verified end to end
-   off-ISO (see below) but has never run against a live root.
-3. **Real internet traffic.** `ping` to a host on the LAN works. Nothing has
+1. **Real internet traffic.** `ping` to a host on the LAN works. Nothing has
    yet proved that a name resolves or that a TCP connection completes.
-   `ping 1.1.1.1` and a `wget` are still unrun.
+   `ping 1.1.1.1`, `nslookup` and a `wget` are still unrun. One attempt
+   returned 1ms / 1000ms / 3878ms with 50% loss to the default gateway,
+   which is ICMP rate-limiting, not a Copper fault — but it does mean the
+   story is unproven rather than disproven.
+2. **Skipping the boot animation with a real keypress.** See "the WSL pty
+   problem" below. The code is correct; the only terminal available on the
+   build host cannot confirm it.
+3. **Persistence.** Answers apply for the live session only. Rebooting runs
+   the wizard again.
 
 ## "ip: command not found" — the cause, and three wrong answers first
 
@@ -191,9 +211,9 @@ running it on WSL rewrites WSL's real accounts. Reproduce it by driving the real
 wizard through a pty; piping answers takes a different code path.
 
 1. **`-G <group>` needs the group to exist first.** Otherwise
-   `adduser: unknown group dragon`, and nothing is created. Omitting `-G` does
+   `adduser: unknown group <user>`, and nothing is created. Omitting `-G` does
    not help — busybox then tries to create a group of the same name itself and
-   reports `adduser: group 'dragon' in use`. So: `addgroup <user>` first.
+   reports `adduser: group '<user>' in use`. So: `addgroup <user>` first.
 2. **`-D` is ambiguous on this busybox** — `--debug`, `--disabled-login` and
    `--disabled-password` all claim it. `adduser -D …` answers `Option d is
    ambiguous`, prints its usage, creates nothing, and exits 0. Use the long
@@ -201,10 +221,11 @@ wizard through a pty; piping answers takes a different code path.
 3. **`/etc/passwd`, `/etc/group` and `/etc/shadow` all shipped without a
    trailing newline.** Appending to a file that does not end in one does not
    begin a line, it concatenates onto the last record, producing
-   `…:/bin/falsedragon:x:1000:…`. One unparseable line instead of two records,
-   and then busybox refuses to read the file at all: `addgroup: /etc/passwd: bad
-   record`, once per supplementary group. Fixed at source, and
-   `ensure_trailing_newline()` also guards at runtime.
+   `…:/bin/falsedemo:x:1000:…` — the last existing record ending in `false`
+   welded to the new one starting with `demo`. One unparseable line instead of
+   two records, and then busybox refuses to read the file at all: `addgroup:
+   /etc/passwd: bad record`, once per supplementary group. Fixed at source,
+   and `ensure_trailing_newline()` also guards at runtime.
 4. **busybox chatter.** With the group present it still prints `warn:
    /etc/adduser.conf does not exist` and `fatal: addgroup with two arguments is
    an unspecified operation` — the word "fatal", on a boot where nothing failed.
@@ -231,7 +252,7 @@ username; line 2 is the display name.
 **The prompt reads the same marker**, because the shell genuinely does run as
 root: `copper-init` execs it directly, there is no `su` and no login, so
 `getpwuid(getuid())` is `root`. That is why the prompt said `root@copper` on a
-machine that had just announced "Done — welcome, dragon".
+machine that had just announced "Done — welcome, <name>".
 
 Worth being plain about: none of this is a security boundary. There is no login
 in front of the shell, so anyone at the console is uid 0 whatever the working
@@ -244,7 +265,7 @@ never expanded anywhere. `tokenize_line()` now expands a leading `~` (and
 `~user`, via `getpwnam`) on unquoted words only.
 
 Tokens are written into a **separate output buffer**, because expansion makes
-text longer: `~/test` is six characters and `/home/dragon/test` is sixteen, so
+text longer: `~/test` is six characters and `/home/alice/test` is sixteen, so
 writing in place would run past the end of the line buffer. The tokenizer is
 unit-tested directly by `#include`-ing `main.c` with `main` renamed, so the test
 cannot drift from the code that ships.
@@ -256,6 +277,148 @@ Two bugs the tests caught that reading would not have:
 - `#` started a comment mid-word, so `echo x#y` printed `x`.
 
 It also refuses an expansion that will not fit rather than overflowing.
+
+---
+
+# The first-boot screen, and four bugs in it
+
+The wizard used to print a banner and then ask one question at a time. It
+now draws a logo, then a table with every question on it at once. Four real
+bugs came out of that, and every one of them was invisible until the thing
+was actually run under a pty and rendered to a screen.
+
+## The form was never actually centred
+
+`render_form()` computed
+
+```c
+int left = (term_cols - w) / 2;
+```
+
+and used `left` when positioning the cursor — but never printed it. The box
+drew hard against the left edge while the cursor sat seven columns further
+right. So typing appended *after* the hint instead of over it, and every
+answer came out looking like the default with your text stuck to the end.
+
+The fix is a file-scope `box_left`, set once by `box_begin(w, rows)` and
+emitted as leading spaces by `box_line()` and `box_rule()`. It is state
+rather than a parameter on purpose: there are two consumers of the number,
+and a parameter is one more thing to pass wrong.
+
+## The typed characters were never stored
+
+This is the one that would have shipped a completely broken wizard.
+
+`type_into()` echoed each character to the screen and incremented `n`, and
+then broke on Enter and wrote the terminator — but there was no line
+storing the character into the buffer:
+
+```c
+putchar(f->secret ? '*' : (char)c);
+n++;                      /* counted it, echoed it, kept it nowhere */
+```
+
+The field came back empty. Every answer was the hint, or the default.
+
+It looks correct in a diff. It looks correct when you read it. It only
+fails when something reads the buffer afterwards, and the only thing that
+reads the buffer afterwards is the account-creation code, which runs later
+and cannot tell you which field went wrong.
+
+## Hostname and timezone were never validated on the table path
+
+The plain prompt path checked both. The table path checked only the
+username. Both values go into `system()`:
+
+```c
+run("echo %s > /etc/hostname", host);
+run("ln -sf /usr/share/zoneinfo/%s /etc/localtime", tz);
+```
+
+so on the table path the answer was shell. Not a theoretical concern: the
+same code that renders a box will happily accept `; touch /tmp/pwned` and
+paste it into a command line.
+
+Every field now carries a validator and a rejection message, and both paths
+use the same one:
+
+```c
+int (*ok)(const char *);
+```
+
+Verified by driving the form with `; touch /tmp/COPPER_PWNED` as a hostname
+and `` UTC`touch /tmp/COPPER_PWNED` `` as a timezone, then checking the file
+did not appear. It did not appear, and the collected values were the good
+ones that followed them.
+
+## An empty stdin spun forever
+
+In the plain path the username prompt was a `do { ... } while (!valid_user())`.
+On EOF, `fgets` fails, the buffer stays empty, an empty answer is not a valid
+username, and the loop re-asks — forever, as fast as the console takes it.
+`read_line()` now sets a flag, the loop breaks on it, and `main()` refuses to
+apply a half-filled form rather than creating an account with an empty
+password.
+
+Note this is *not* a hang in `getpass()`. The plain path blocks in `getpass`
+waiting for a real `/dev/tty`, which is correct — the plain path exists for
+a serial console, which is a tty.
+
+## How the animation is made skippable, and why that is unverified
+
+The shield scrolls by at about 100ms per line, and any key skips to the end.
+Detection is a zero-timeout `select()` on stdin.
+
+**On this build host that cannot be tested, and not because of the wizard.**
+On a WSL2 pty slave, `select`, `poll`, `O_NONBLOCK` reads and `FIONREAD` all
+report "nothing waiting" for a byte that is demonstrably in the line
+discipline's queue — the tty even echoes it. In canonical mode `read()` then
+blocks forever. Raw mode reads work fine, which is why driving the form
+works and only the skip does not.
+
+So the fix is built not to depend on the detection working. `boot_sequence()`
+ends with an unconditional
+
+```c
+tcflush(STDIN_FILENO, TCIFLUSH);
+```
+
+before the form appears. A stray keypress can never become the first
+character of the first answer, whether or not anything noticed it first.
+That was a real user-visible bug: on a WSL pty the skip key survived into
+the form and left `riend` where `friend` should have been.
+
+If the skip does not work on a real console it is a cosmetic problem — the
+animation plays out in full and the flush still does its job. But it has not
+been seen working, and it should be confirmed on the next VMware boot.
+
+## The wordmark could never have fit
+
+The display `COPPER LINUX` cut is 22 rows by 194 columns. An 80-column VGA
+console wraps it into an unreadable mess, so it was never going to work
+there. The wordmark that ships is a compact 7-row, 68-column 5x7 block font
+that renders correctly at 80 columns. The shield, at 40x77, *does* fit and is
+used exactly as supplied.
+
+The art is generated:
+
+```sh
+python3 tools/gen-boot-art.py     # -> iso/firstboot/boot-art.h
+```
+
+not pasted into the C file, because a single dropped `@` in a block of ASCII
+is invisible in a diff. One source, one command, no hand-editing.
+
+## The branding line is gone
+
+"handcrafted by 12hrformat" was removed from all thirteen files that carried
+it — the CI workflow, `grub.cfg`, `build.sh`, all three `copper-*` scripts,
+`iso/live/init`, five files under `rootfs-overlay`, and `copper-init.c`. A
+dangling bare `#` left at the top of `resolv.conf` went with it.
+
+The same line crediting farcrowx in `copper-firstboot.c` went too, so no
+per-file attribution header ships at all. Repo-wide grep confirms zero
+remaining occurrences.
 
 ---
 
@@ -402,14 +565,18 @@ it was still worth doing properly.
 
 Ordered by what unblocks the most.
 
-## G1 — Confirm the first-boot wizard ⚠️ blocks the identity claim
+## G1 — Confirm the first-boot wizard ✅ done
 
 **Done looks like:** the screen after `copper-net: nameserver …` shows the
 wizard asking for a name, and a `copper-sh` prompt afterwards.
 
-Boot `copper4.iso`, screenshot the window. That is the whole task. Nothing
-downstream — persistence especially — is testable until it is answered, and it
-has never been executed, so expect it to be the next thing to break.
+**Answered.** artifact6 booted to the animation, the table, a created
+account, and a prompt in `/home/<user>`. `copper charge` and
+`copper rollback` were both run from that shell and both worked.
+
+One loose end under this goal: the animation's keypress-to-skip could not be
+exercised on the build host (see above). Confirm it, or on a real console,
+on the next boot.
 
 ## G2 — Prove the internet, not just DHCP
 
@@ -591,13 +758,24 @@ Being precise here matters, because it is easy to mistake "it compiles" for
 - **`copper-init.c` and `copper-firstboot.c`** compile clean under GCC 12.2
   with `-Wall -Wextra -Wpedantic -Wshadow -Wwrite-strings`, and in CI against
   musl.
+- **The first-boot wizard, driven under a pty.** A Python `pty.fork()` driver
+  plus a ~60-line terminal emulator (CUP, ED, EL, cursor show/hide, CR/LF/BS,
+  scrolling) rendered every screen: the animation, the form empty, a field
+  typed into, a rejected username, masked passwords, and a 50x14 terminal too
+  small for the table. Width tracking is how the box was caught not wrapping.
+- **The hostile-answer test.** `; touch /tmp/COPPER_PWNED` typed as a hostname
+  and `` UTC`touch /tmp/COPPER_PWNED` `` as a timezone: both refused, the
+  file was never created, and the values the wizard actually collected were the
+  valid ones that followed.
 
 ## Has never run
 
-- **A full clean first-boot wizard run**, banner to `dragon@copper` prompt in
-  one pass. Each stage is fixed and individually confirmed. G1.
-- **`copper charge` against a booted system.** Verified off-ISO only.
-- **Any real internet traffic.** No `ping`, no `nslookup`, no `wget`. G2.
+- **Any real internet traffic.** No `ping` to the internet, no `nslookup`,
+  no `wget`. LAN ping works. G2.
+- **Keypress-to-skip on the boot animation.** The code is right and the
+  stray-key flush is independent of it, but the only terminal on the build
+  host cannot report input readiness. Confirm on a real console.
+- **Persistence.** Answers do not survive a reboot. G6.
 
 ## A note on green CI runs
 

@@ -1,4 +1,3 @@
-# Copper Linux — handcrafted by 12hrformat
 # Build Copper Linux as a bootable live ISO on GitHub Actions.
 # Produces iso/out/copper.iso as an artifact.
 #

@@ -1,6 +1,5 @@
 #!/bin/busybox sh
 # copper charge — fetch and apply hotfixes from the Copper repo.
-# handcrafted by 12hrformat
 #
 # Reads hotfixes.json from the repo, finds failing code in local files,
 # backs up the original, and replaces it with the fixed code.

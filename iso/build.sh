@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Copper Linux — handcrafted by 12hrformat
 # build.sh — assemble Copper Linux, a from-source Linux distro, into a
 # bootable live ISO. No Debian/Arch packages: every shipped binary is built
 # from upstream source in this script (kernel, musl, busybox, coreutils and

@@ -1,12 +1,10 @@
 /*
  * copper-firstboot — first-boot personalization, in the spirit of the OOBE
- * handcrafted by farcrowx
  * on real distros / Windows. copper-init runs this once (until the marker
  * /etc/copper-firstboot.done exists).
  *
- * Asks for: name, username, hostname, timezone, and passwords (root + the
- * named user). Creates the account via busybox adduser, sets passwords via
- * busybox chpasswd, wires up /etc/localtime.
+ * Draws the boot animation, then a centred table of every question, then
+ * applies the answers.
  *
  * Live-session only for now (the overlay is tmpfs, so it re-runs next
  * boot) — real persistence is a later phase.
@@ -21,9 +19,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <termios.h>
 #include <unistd.h>
+
+#include "boot-art.h"
+
+/* How long each row of the shield is left on screen. The whole point is that
+   it is drawn a row at a time rather than appearing at once. 40 rows at 100ms
+   is a four second boot animation, which is longer than it sounds -- so it is
+   skippable: press any key and it snaps to the end. Change it here. */
+#define BOOT_LINE_DELAY_MS 100
 
 static void banner(void) {
     printf("\n===================================================\n");
@@ -35,10 +44,324 @@ static void banner(void) {
     printf("coming in a later build.)\n\n");
 }
 
+/* Set once stdin runs out. Any prompt that loops on a rejected answer has to
+   be able to break out on this, or it spins forever: fgets() keeps failing,
+   the buffer stays empty, and an empty answer is not a valid username, so the
+   do/while never ends. That is a hot loop on a machine nobody is watching. */
+static int stdin_eof;
+
 static int read_line(char *buf, size_t cap) {
-    if (!fgets(buf, cap, stdin)) return 0;
+    if (!fgets(buf, cap, stdin)) { stdin_eof = 1; return 0; }
     buf[strcspn(buf, "\r\n")] = '\0';
     return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  the terminal                                                       */
+/* ------------------------------------------------------------------ */
+
+static int term_cols = 80, term_rows = 25;
+
+/* Ask the terminal how big it is, rather than assuming.
+
+   The VGA console answers 80x25 no matter how large the emulator window is, so
+   80x25 is the number that has to be designed against. But a serial console,
+   a pty in a test harness, or someone running this over ssh can all be
+   something else, and art sized for 80x25 on a 200-column terminal looks lost
+   and broken in the other direction. */
+static void term_size(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+        term_cols = ws.ws_col;
+        term_rows = ws.ws_row;
+    }
+}
+
+/* The animation and the form are for a real terminal and nothing else. On a
+   serial console they are worse than decoration: they clear the scrollback
+   that somebody is reading to find out why the boot is stuck. So this is a
+   gate, not a preference. */
+static int ui_fancy;
+
+static void ui_init(void) {
+    term_size();
+    ui_fancy = isatty(STDOUT_FILENO) && isatty(STDIN_FILENO) &&
+               term_cols >= 46 && term_rows >= 14;
+}
+
+static void msleep(int ms) { usleep((useconds_t)ms * 1000); }
+static void clr(void)      { fputs("\033[2J\033[H", stdout); }
+static void at(int r, int c) { printf("\033[%d;%dH", r, c); }
+static void cursor_show(int on) { fputs(on ? "\033[?25h" : "\033[?25l", stdout); }
+
+/* Is somebody leaning on a key? Used to let the boot animation be skipped. */
+static int key_pending(void) {
+    fd_set fds;
+    struct timeval tv = { 0, 0 };
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
+}
+
+/* Throw away anything already typed.
+
+   tcflush, not read(). A read() here would wait for a COMPLETE LINE, and the
+   tty is in canonical mode at this point in the boot -- so on a machine where
+   the key that skipped the animation was not followed by Enter, the read
+   blocks until the next keypress. That turns "press any key to skip" into a
+   frozen screen, and then that stray keypress arrives as the first character
+   of the first answer, silently eating the first letter of it. */
+static void drain_keys(void) {
+    tcflush(STDIN_FILENO, TCIFLUSH);
+}
+
+/* ------------------------------------------------------------------ */
+/*  the boot animation                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Type the shield in a row at a time, then wipe it and show the wordmark, then
+   wipe that too and hand over to the questions.
+
+   The shield is 40 rows and the console is 25, so it cannot be centred -- it
+   scrolls, which is the right behaviour for a boot: the art builds upward out
+   of the log. The wordmark and the form both fit, so those are centred. */
+static void boot_sequence(void) {
+    if (!ui_fancy) { banner(); return; }
+
+    cursor_show(0);
+    clr();
+
+    /* Draw a row at a time. If somebody presses a key the pause stops, but the
+       remaining rows are still drawn -- instantly -- so that skipping produces
+       the finished shield rather than a half-drawn one. */
+    int skip = 0;
+    int indent = (term_cols - COPPER_SHIELD_WIDTH) / 2;
+    if (indent < 0) indent = 0;
+    for (int i = 0; i < COPPER_SHIELD_ROWS; i++) {
+        printf("%*s%s\n", indent, "", COPPER_SHIELD[i]);
+        if (!skip) {
+            msleep(BOOT_LINE_DELAY_MS);
+            if (key_pending()) skip = 1;
+        }
+        /* Once skipping, keep flushing: a second keypress while the rest of
+           the art draws should not turn up as the first character of the first
+           answer either. */
+        if (skip) drain_keys();
+    }
+
+    msleep(350);
+    clr();
+
+    int pad = (term_rows - COPPER_WORDMARK_ROWS) / 2;
+    if (pad < 0) pad = 0;
+    for (int i = 0; i < pad; i++) putchar('\n');
+    for (int i = 0; i < COPPER_WORDMARK_ROWS; i++)
+        printf("%s\n", COPPER_WORDMARK[i]);
+    msleep(1400);
+
+    clr();
+
+    /* Discard every key pressed during the animation, unconditionally.
+
+       This does not depend on the skip detection having worked, which matters:
+       that detection is a select() for a waiting key, and there is at least
+       one tty -- a WSL2 pty, which is the only kind of terminal available on
+       the build host -- where select reports "nothing waiting" for a byte
+       that is demonstrably sitting in the line discipline's queue. On such a
+       tty the animation cannot be skipped, but without this line the key that
+       was pressed anyway survives into the form and silently eats the first
+       character of the first answer. A stray keystroke must never be able to
+       corrupt an answer, whether or not anything noticed it first. */
+    tcflush(STDIN_FILENO, TCIFLUSH);
+
+    cursor_show(1);
+}
+
+/* ------------------------------------------------------------------ */
+/*  the questions, as a table                                         */
+/* ------------------------------------------------------------------ */
+
+enum { F_NAME, F_USER, F_HOST, F_ROOTPW, F_USERPW, F_TZ, F_COUNT };
+
+/* Capacity of every answer buffer, on screen and off. Generous on purpose:
+   the field editor caps what can be typed to what fits inside the box, so
+   nothing this size can be filled in practice, and every buffer being the same
+   size means no copy between them can ever truncate. */
+#define FIELD_CAP 192
+
+/* Defined further down, with the rest of the input checks. */
+static int valid_user(const char *s);
+static int valid_host(const char *s);
+static int valid_tz(const char *s);
+
+struct field {
+    const char *label;
+    const char *hint;      /* what to type, or what will be used if blank */
+    const char *ask;       /* the status line while this one is live */
+    const char *reject;    /* why the last answer was not accepted */
+    char value[FIELD_CAP];
+    int  secret;
+    int  has_value;
+    /* Every field that ends up inside a system() command needs one of these.
+
+     * This is not decoration. The hostname and the timezone are both pasted
+     * into a shell command line -- `echo %s > /etc/hostname`,
+     * `ln -sf /usr/share/zoneinfo/%s /etc/localtime` -- so an answer that has
+     * not been through valid_host()/valid_tz() is arbitrary shell. The plain
+     * prompt path always checked them; the table path checked only the
+     * username, so the same typo was accepted on one terminal and refused on
+     * another, and the table one could run what it was given. */
+    int (*ok)(const char *);
+};
+
+static int ok_host(const char *s) { return !s[0] || valid_host(s); }
+static int ok_tz(const char *s)   { return !s[0] || valid_tz(s); }
+static int ok_pw(const char *s)   { return s[0] != '\0'; }
+
+/* All members, always. A partial initialiser silently zeroes the rest, and
+   there is no way to see at a glance that a missing `secret` is 0 rather than
+   a mistake -- which for a password field is the difference between masked and
+   printed in the clear. */
+#define FIELD(lbl, hint, prompt, rej, sec, chk) \
+    { (lbl), (hint), (prompt), (rej), {0}, (sec), 0, (chk) }
+
+static struct field fields[F_COUNT] = {
+    FIELD("Your name",     "friend",                 "What should Copper call you?", 0, 0, NULL),
+    FIELD("Username",      "letters, digits, dash, underscore",
+          "Pick a login name", "Letters, digits, dash and underscore only", 0, valid_user),
+    FIELD("Hostname",      "copper",                 "Name this machine",
+          "Letters, digits, dot and dash only", 0, ok_host),
+    FIELD("Root password", "at least one character", "Set the root password",
+          "A password cannot be blank", 1, ok_pw),
+    FIELD("Your password", "at least one character", "Set your own password",
+          "A password cannot be blank", 1, ok_pw),
+    FIELD("Timezone",      "UTC",                    "Timezone, e.g. Europe/London",
+          "That does not look like a timezone", 0, ok_tz),
+};
+
+/* |   label(18)   value */
+#define LABEL_COL 18
+
+static int box_w(void) {
+    int w = term_cols - 8;
+    if (w > 66) w = 66;
+    if (w < 40) w = 40;
+    return w;
+}
+
+/* Where the box starts, in columns from the left edge.
+
+   This is state rather than a parameter because there is a second consumer of
+   the number: render_form() positions the cursor by adding LABEL_COL to it, and
+   when the two disagreed the box drew hard against the left edge while the
+   cursor sat seven columns further right -- so typing landed after the hint
+   instead of over it, and every answer came out looking like the default with
+   your text appended to it. One number, one owner, no way to get it wrong. */
+static int box_left;
+
+static void box_begin(int w, int rows) {
+    box_left = (term_cols - w) / 2;
+    if (box_left < 0) box_left = 0;
+    (void)rows;
+}
+
+static void box_pad(void) {
+    for (int i = 0; i < box_left; i++) putchar(' ');
+}
+
+static void box_line(const char *text, int w) {
+    int room = w - 2;
+    int len = (int)strlen(text);
+    /* Truncate, never wrap.
+
+       On a narrow terminal a hint can easily be wider than the box -- at 50
+       columns there are 17 columns of value cell and the username hint is 31
+       characters -- and a wrapped line breaks the right-hand wall off and
+       leaves a fragment on the next row. A table with a missing wall looks
+       broken; a table with a clipped cell looks deliberate. */
+    if (len > room) len = room;
+    int pad = room - len;
+    box_pad();
+    printf("|%.*s%*s|\n", len, text, pad, "");
+}
+
+static void box_rule(int w) {
+    char bar[80];
+    memset(bar, '-', (size_t)(w - 2));
+    bar[w - 2] = '\0';
+    box_pad();
+    printf("+%s+\n", bar);
+}
+
+/* Draw the whole form and leave the cursor sitting in the active field's value
+   cell, so the first character typed lands in the right place. */
+static void render_form(int active, const char *status) {
+    int w = box_w();
+    int total = 4 + F_COUNT + 2;
+    int top = (term_rows - total) / 2;
+    if (top < 0) top = 0;
+
+    clr();
+    for (int i = 0; i < top; i++) putchar('\n');
+    box_begin(w, total);
+
+    box_rule(w);
+    box_line("   Copper Linux  -  first boot setup", w);
+    box_rule(w);
+
+    for (int i = 0; i < F_COUNT; i++) {
+        char shown[220];
+        const struct field *f = &fields[i];
+        if (f->secret && f->has_value) {
+            int n = (int)strlen(f->value);
+            if (n > 40) n = 40;
+            for (int k = 0; k < n; k++) shown[k] = '*';
+            shown[n] = '\0';
+        } else if (f->has_value) {
+            snprintf(shown, sizeof shown, "%s", f->value);
+        } else {
+            snprintf(shown, sizeof shown, "%s", f->hint);
+        }
+        char row[256];
+        snprintf(row, sizeof row, "   %-*s %s", LABEL_COL, f->label, shown);
+        box_line(row, w);
+    }
+
+    box_rule(w);
+    box_line(status, w);
+    box_rule(w);
+
+    if (active >= 0) at(top + 4 + active, box_left + 4 + LABEL_COL + 2);
+}
+
+/* ------------------------------------------------------------------ */
+/*  typing into a field                                                */
+/* ------------------------------------------------------------------ */
+
+static struct termios saved_tio;
+static int raw_on;
+
+/* Non-canonical with no echo, so a keystroke arrives when it is pressed and is
+   drawn by us rather than by the tty driver. ISIG is deliberately left on, so
+   Ctrl-C still kills the wizard instead of being swallowed as a character. */
+static void raw_begin(void) {
+    if (!isatty(STDIN_FILENO)) return;
+    struct termios t;
+    if (tcgetattr(STDIN_FILENO, &t) != 0) return;
+    saved_tio = t;
+    t.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &t) == 0) raw_on = 1;
+}
+
+static void raw_end(void) {
+    if (raw_on) { tcsetattr(STDIN_FILENO, TCSANOW, &saved_tio); raw_on = 0; }
+}
+
+/* Erase n characters to the left of the cursor. */
+static void erase_left(int n) {
+    while (n-- > 0) { putchar('\b'); putchar(' '); putchar('\b'); }
 }
 
 static int valid_user(const char *u) {
@@ -76,12 +399,13 @@ static int valid_tz(const char *z) {
    Appending to a file that does not end in one does not begin a new line, it
    concatenates onto the last record. So writing the new account produced
 
-       nobody:x:65534:65534:nobody:/nonexistent:/bin/falsedragon:x:1000:...
+       nobody:x:65534:65534:nobody:/nonexistent:/bin/falsedemo:x:1000:...
 
-   which is one unparseable line instead of two records. busybox then refused
-   to read the file at all ("addgroup: /etc/passwd: bad record", once per
-   supplementary group), and the account that had just been created was not
-   readable by anything.
+   which is one unparseable line instead of two records: the last existing
+   record ending in "false" and the brand new one starting with "demo",
+   welded together. busybox then refused to read the file at all
+   ("addgroup: /etc/passwd: bad record", once per supplementary group), and
+   the account that had just been created was not readable by anything.
 
    The cost of fixing it is one byte per file. The alternative is an account
    that exists on disk and does not work, which is exactly what happened. */
@@ -343,13 +667,212 @@ static void set_password(const char *user, const char *pw) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  asking                                                            */
+/* ------------------------------------------------------------------ */
+
+/* Type one field, showing what is typed as it goes.
+
+   This is deliberately dumb: it draws the form, reads keys, echoes them at the
+   cursor, and leaves validation to collect(). That split is why a rejected
+   answer can re-ask with a reason on screen -- the old looped-on-an-invalid-
+   username prompt gave no reason at all. */
+static void type_into(int idx, const char *status, char *dest, size_t cap) {
+    struct field *f = &fields[idx];
+
+    /* Leave room so a long answer cannot run past the right-hand wall and wrap,
+       which would tear the box in half. */
+    int maxlen = box_w() - LABEL_COL - 8;
+    if (maxlen > (int)cap - 1) maxlen = (int)cap - 1;
+    if (maxlen < 1) maxlen = 1;
+
+    render_form(idx, status);
+    dest[0] = '\0';
+    int n = 0;
+
+    for (;;) {
+        int c = getchar();
+        if (c == EOF) { dest[n] = '\0'; return; }
+        if (c == '\r' || c == '\n') break;
+        if (c == 127 || c == 8) {                 /* backspace */
+            if (n > 0) { n--; erase_left(1); }
+            continue;
+        }
+        if (c == 21) {                            /* Ctrl-U clears the field */
+            erase_left(n);
+            n = 0;
+            continue;
+        }
+        if (c < 32 || c > 126) continue;          /* arrows, function keys */
+        if (n >= maxlen) continue;
+        dest[n++] = (char)c;
+        putchar(f->secret ? '*' : (char)c);
+    }
+    dest[n] = '\0';
+}
+
+/* Collect one field, in whichever mode this terminal turned out to support. */
+static void collect(int idx) {
+    struct field *f = &fields[idx];
+    f->has_value = 0;
+    f->value[0] = '\0';
+
+    if (ui_fancy) {
+        raw_begin();
+        const char *status = f->ask;
+        for (;;) {
+            if (f->secret) {
+                type_into(idx, status, f->value, sizeof f->value);
+                /* Confirm. The field is shown empty while this happens so the
+                   stored value is never on screen in the clear. */
+                char again[FIELD_CAP];
+                fields[idx].has_value = 0;
+                type_into(idx, "Type it once more to be sure",
+                          again, sizeof again);
+                if (again[0] && strcmp(again, f->value) == 0) break;
+                f->value[0] = '\0';
+                msleep(900);
+                continue;
+            }
+            type_into(idx, status, f->value, sizeof f->value);
+            if (f->ok && !f->ok(f->value)) {
+                f->value[0] = '\0';
+                status = f->reject;
+                continue;
+            }
+            break;
+        }
+        raw_end();
+        f->has_value = 1;
+        return;
+    }
+
+    /* Plain terminal: the original one-line prompts, which is also what the
+       serial console and the test harness use. */
+    char buf[FIELD_CAP] = "";
+    switch (idx) {
+    case F_NAME:
+        printf("Your name: ");
+        fflush(stdout);
+        read_line(buf, sizeof buf);
+        break;
+    case F_USER:
+        for (;;) {
+            printf("Username [letters, digits, - _]: ");
+            fflush(stdout);
+            if (!read_line(buf, sizeof buf)) {
+                /* Nobody left to answer. Use a name that is certain to be
+                   valid rather than re-asking into a spin. */
+                snprintf(buf, sizeof buf, "%s", "copper");
+                break;
+            }
+            if (valid_user(buf)) break;
+            printf("Letters, digits, dash and underscore only.\n");
+        }
+        break;
+    case F_HOST:
+        printf("Hostname [copper]: ");
+        fflush(stdout);
+        if (read_line(buf, sizeof buf) && buf[0] && !valid_host(buf))
+            buf[0] = '\0';
+        break;
+    case F_ROOTPW:
+        read_password("Password (root): ", buf, sizeof buf,
+                      "Confirm root password: ");
+        break;
+    case F_USERPW:
+        read_password("Password (for you): ", buf, sizeof buf,
+                      "Confirm your password: ");
+        break;
+    case F_TZ:
+        printf("Timezone [UTC]: ");
+        fflush(stdout);
+        if (read_line(buf, sizeof buf) && buf[0] && !valid_tz(buf))
+            buf[0] = '\0';
+        break;
+    }
+    snprintf(f->value, sizeof f->value, "%s", buf);
+    f->has_value = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  applying, and the two end screens                                  */
+/* ------------------------------------------------------------------ */
+
+static const char *const apply_steps[] = {
+    "hostname and networking", "your account", "passwords", "timezone", NULL
+};
+
+static void draw_progress(int upto) {
+    if (!ui_fancy) return;
+    int w = box_w();
+    int n = 0;
+    while (apply_steps[n]) n++;
+    int total = 4 + n + 2;
+    int top = (term_rows - total) / 2;
+    if (top < 0) top = 0;
+
+    clr();
+    for (int i = 0; i < top; i++) putchar('\n');
+    box_begin(w, total);
+    box_rule(w);
+    box_line("   Copper Linux  -  setting things up", w);
+    box_rule(w);
+    for (int i = 0; i < n; i++) {
+        char row[256];
+        snprintf(row, sizeof row, "   [%c] %s",
+                 i < upto ? 'x' : ' ', apply_steps[i]);
+        box_line(row, w);
+    }
+    box_rule(w);
+    box_line("one moment", w);
+    box_rule(w);
+}
+
+static void screen_done(const char *name) {
+    if (!ui_fancy) {
+        printf("\n===================================================\n");
+        printf("  Done -- welcome, %s.\n", name);
+        printf("  Copper is yours. Type 'help' to see builtins.\n");
+        printf("===================================================\n\n");
+        return;
+    }
+    int w = box_w();
+    int top = (term_rows - 5) / 2;
+    if (top < 0) top = 0;
+
+    clr();
+    for (int i = 0; i < top; i++) putchar('\n');
+    box_begin(w, 5);
+    box_rule(w);
+    {
+        char l1[256], l2[256], l3[256];
+        snprintf(l1, sizeof l1, "   Done -- welcome, %s.", name);
+        snprintf(l2, sizeof l2, "   Copper is yours.");
+        snprintf(l3, sizeof l3, "   Type 'help' to see the builtins.");
+        box_line(l1, w);
+        box_line(l2, w);
+        box_line(l3, w);
+    }
+    box_rule(w);
+    msleep(2600);
+    /* Hand the screen over clean: copper-sh prints its own banner next, and
+       two banners stacked in 25 rows looks like a mistake. */
+    clr();
+}
+
 int main(void) {
-    char name[128]  = "";
-    char user[64]   = "";
-    char host[64]   = "copper";
-    char tz[128]    = "UTC";
-    char rootpw[256];
-    char userpw[256];
+    /* Every one of these is FIELD_CAP, not a snug 64 or 128. The values have
+       already been validated -- a username is capped at 32, a hostname at 63,
+       a timezone at 100 -- but a compiler cannot see that through the struct,
+       and a buffer smaller than its source is exactly the kind of thing that
+       truncates silently at 3am. Same size as the field, so it cannot. */
+    char name[FIELD_CAP];
+    char user[FIELD_CAP];
+    char host[FIELD_CAP];
+    char tz[FIELD_CAP];
+    char rootpw[FIELD_CAP];
+    char userpw[FIELD_CAP];
 
     /* Unbuffered, once, so no prompt can ever be left sitting in a buffer
        waiting for a newline to push it out. /dev/console is a character
@@ -358,48 +881,47 @@ int main(void) {
        happens to flush it -- which looked like the wizard hanging. */
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    banner();
-    fflush(stdout);
+    ui_init();
+    boot_sequence();
 
-    printf("Your name: ");
-    fflush(stdout);
-    read_line(name, sizeof name);
-    if (!name[0]) snprintf(name, sizeof name, "friend");
+    /* Every question up front, in the table. They used to be interleaved with
+       the work -- your own password was asked after the account had already
+       been created -- which meant the questions were not in one place on
+       screen and there was no single picture of what was still outstanding. */
+    for (int i = 0; i < F_COUNT; i++) collect(i);
 
-    do {
-        printf("Username [letters, digits, - _]: ");
-        fflush(stdout);
-        read_line(user, sizeof user);
-    } while (!valid_user(user));
-
-    printf("Hostname [copper]: ");
-    fflush(stdout);
-    {
-        char h[64] = "";
-        if (read_line(h, sizeof h) && h[0] && valid_host(h))
-            snprintf(host, sizeof host, "%s", h);
+    /* If nobody answered, do not half-apply the form. Creating an account from
+       whatever happened to be in the buffers -- an empty password above all --
+       is worse than creating none and saying so. */
+    if (stdin_eof) {
+        printf("\nNo answers were entered, so no account was set up.\n");
+        return 1;
     }
 
-    read_password("Password (root): ", rootpw, sizeof rootpw,
-                  "Confirm root password: ");
+    /* Blank means "use the default shown as the hint". A username is the one
+       field with no default: an account called "" is not an account. */
+    snprintf(name, sizeof name, "%s",
+             fields[F_NAME].value[0] ? fields[F_NAME].value : "friend");
+    snprintf(user, sizeof user, "%s", fields[F_USER].value);
+    snprintf(host, sizeof host, "%s",
+             fields[F_HOST].value[0] ? fields[F_HOST].value : "copper");
+    snprintf(tz, sizeof tz, "%s",
+             fields[F_TZ].value[0] ? fields[F_TZ].value : "UTC");
+    snprintf(rootpw, sizeof rootpw, "%s", fields[F_ROOTPW].value);
+    snprintf(userpw, sizeof userpw, "%s", fields[F_USERPW].value);
 
-    printf("Timezone [UTC]: ");
-    fflush(stdout);
-    {
-        char z[128] = "";
-        if (read_line(z, sizeof z) && z[0] && valid_tz(z))
-            snprintf(tz, sizeof tz, "%s", z);
-    }
+    if (!ui_fancy) printf("\nSetting things up...\n");
 
     /* --- apply ------------------------------------------------------- */
 
-    printf("\nSetting things up...\n");
+    draw_progress(0);
 
     /* hostname + hosts */
     run("echo %s > /etc/hostname", host);
     run("echo '127.0.0.1 localhost %s' > /etc/hosts", host);
     run("echo '::1 localhost ip6-localhost ip6-loopback' >> /etc/hosts");
     run("/bin/busybox hostname %s", host);
+    draw_progress(1);
 
     /* The named user, with copper-sh as their login shell.
 
@@ -407,10 +929,10 @@ int main(void) {
        the busybox that actually ships in the ISO rather than by reading docs:
 
        -G <own group>   The group must already exist. Without it adduser fails
-            with "adduser: unknown group dragon" and creates nothing. So the
+            with "adduser: unknown group <user>" and creates nothing. So the
             group goes in first, one line above. Omitting -G entirely does not
             help: busybox then tries to create a group of the same name itself
-            and reports "adduser: group 'dragon' in use".
+            and reports "adduser: group '<user>' in use".
 
        --disabled-password  Not -D. On this busybox -D is AMBIGUOUS between
             --debug, --disabled-login and --disabled-password, so the short
@@ -450,14 +972,18 @@ int main(void) {
            in the middle of the password question. */
         run_quiet("/bin/busybox addgroup %s %s", user, *g);
     }
-    read_password("Password (for you): ", userpw, sizeof userpw,
-                  "Confirm your password: ");
+    draw_progress(2);
+    /* Both passwords come from the table now. Asking for the user's own
+       password here, after the account already existed, meant the question
+       arrived in the middle of the progress output instead of up front with
+       everything else, and a person who pressed Ctrl-C at the wrong moment
+       got an account with no password and no way back to the question. */
     set_password("root", rootpw);
     set_password(user, userpw);
 
     /* timezone */
     {
-        char zfile[160];
+        char zfile[FIELD_CAP + 64];
         snprintf(zfile, sizeof zfile, "/usr/share/zoneinfo/%s", tz);
         if (access(zfile, R_OK) == 0) {
             run("ln -sf /usr/share/zoneinfo/%s /etc/localtime", tz);
@@ -466,6 +992,7 @@ int main(void) {
             printf("(timezone %s not found — staying on UTC)\n", tz);
         }
     }
+    draw_progress(4);
 
     /* done marker
 
@@ -488,9 +1015,6 @@ int main(void) {
         }
     }
 
-    printf("\n===================================================\n");
-    printf("  Done — welcome, %s.\n", name);
-    printf("  Copper is yours. Type 'help' to see builtins.\n");
-    printf("===================================================\n\n");
+    screen_done(name);
     return 0;
 }

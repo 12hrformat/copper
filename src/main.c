@@ -286,7 +286,7 @@ static char prompt_host[64] = "copper";
    because the shell genuinely does run as root: copper-init execs it directly,
    there is no su and no login, so getuid() is 0 and getpwuid(0) says "root".
    That is why the prompt said root@copper on a machine where the first-boot
-   wizard had just made an account and announced "Done -- welcome, dragon". */
+   wizard had just made an account and announced "Done -- welcome, <name>". */
 static void firstboot_user(char *buf, size_t cap) {
     buf[0] = '\0';
     FILE *m = fopen("/etc/copper-firstboot.done", "r");
@@ -345,8 +345,8 @@ static char *short_pwd(char *buf, size_t n) {
  * Tokens are written into `out` rather than back into `line`. That is what
  * makes tilde expansion possible: ~ expands to a home directory, which is
  * almost always LONGER than the two characters it replaces, so writing it
- * in place would run past the end of the source buffer. ~/test is six
- * characters and /home/dragon/test is sixteen.
+ * in place would run past the end of the source buffer. `~/test` is six
+ * characters and `/home/alice/test` is sixteen.
  *
  * A leading ~ is expanded only when it starts an unquoted word. That covers
  * ~, ~/x and ~someone/x, and leaves "~ is a tilde" and '~/x' alone, which is
