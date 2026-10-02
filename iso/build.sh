@@ -23,7 +23,8 @@ set -euo pipefail
 # resolving. Pin it down first.
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 cd "$(dirname "$0")"
-ROOT=$(pwd)
+ROOT=$(pwd)                # the iso/ directory: scripts, overlay, work/, out/
+REPO=$(cd "$ROOT/.." && pwd)   # the repository: src/, tests/, hotfixes.json
 WORK="$ROOT/work"; OUT="$ROOT/out"; DL="$WORK/downloads"
 SYS="$WORK/sys"            # our toolchain prefix (musl + musl-gcc)
 TGT="$WORK/rootfs"         # copper rootfs staging tree
@@ -339,7 +340,7 @@ build_tools() {
 # 5. Copper's own pieces: shell, init (PID 1), first-boot wizard
 # ---------------------------------------------------------------
 build_copper() {
-  local SRC="$ROOT/../src"
+  local SRC="$REPO/src"
   if [ -x "$TGT/usr/bin/copper-sh" ] && [ -x "$TGT/usr/bin/copper-init" ] \
      && [ -x "$TGT/usr/bin/copper-firstboot" ] \
      && stamped_skip "$WORK/copper.stamp" "$SELF" "$SRC"/*.c "$SRC"/*.h \
@@ -602,9 +603,14 @@ assert_shell_scripts_parse() {
   # bash -n, not sh -n. build.sh uses process substitution and is run with
   # bash, so checking it with a POSIX shell reports a syntax error in code
   # that runs perfectly well every day.
-  for f in $(cd "$ROOT" && git ls-files '*.sh' 2>/dev/null); do
-    [ -f "$ROOT/$f" ] || continue
-    if ! out=$(bash -n "$ROOT/$f" 2>&1); then
+  # `git ls-files` prints paths relative to the directory you run it in, so
+  # this has to be run from the repository root or the paths do not resolve.
+  # Run from $ROOT and it silently lists iso/ only -- tests/ never gets checked.
+  local n_bash=0
+  for f in $(cd "$REPO" && git ls-files '*.sh' 2>/dev/null); do
+    [ -f "$REPO/$f" ] || { echo "build: $f is listed by git but not on disk" >&2; bad=1; continue; }
+    n_bash=$((n_bash + 1))
+    if ! out=$(bash -n "$REPO/$f" 2>&1); then
       echo "build: $f does not parse:" >&2
       echo "$out" | sed 's/^/       /' >&2
       bad=1
@@ -629,19 +635,30 @@ assert_shell_scripts_parse() {
   done
 
   if [ -n "$posix" ]; then
+    local n_posix=0
     for f in iso/copper.sh iso/copper-charge.sh iso/copper-rollback.sh; do
-      [ -f "$ROOT/$f" ] || continue
-      if ! out=$("$posix" -n "$ROOT/$f" 2>&1); then
+      [ -f "$REPO/$f" ] || {
+        echo "build: $f is missing, so the POSIX check cannot run on it" >&2
+        bad=1; continue; }
+      n_posix=$((n_posix + 1))
+      if ! out=$("$posix" -n "$REPO/$f" 2>&1); then
         echo "build: $f is not POSIX sh, and it runs under busybox ash:" >&2
         echo "$out" | sed 's/^/       /' >&2
         bad=1
       fi
     done
     [ "$bad" -eq 0 ] || exit 1
-    echo "build: every shell script parses, and the busybox tools are POSIX sh"
+    # A check that looked at nothing and reported success is worse than no
+    # check at all, because it reads like the busybox tools were verified.
+    # This loop was skipping all three over a wrong path, and `[ -f ] ||
+    # continue` is precisely the construct that hides that.
+    [ "$n_posix" -eq 3 ] || {
+      echo "build: the POSIX check covered $n_posix of 3 busybox tools" >&2; exit 1; }
+    echo "build: $n_bash shell scripts parse, and $n_posix busybox tools are POSIX sh"
   else
-    echo "build: every shell script parses (no POSIX shell here to check the busybox tools)"
+    echo "build: $n_bash shell scripts parse (no POSIX shell here for the busybox tools)"
   fi
+  [ "$n_bash" -gt 0 ] || { echo "build: no shell scripts were found to check" >&2; exit 1; }
 }
 
 # ---------------------------------------------------------------
@@ -655,7 +672,15 @@ assert_shell_scripts_parse() {
 # So this does not test a copy of the parser. It runs the real script and
 # compares what comes out against what is in the file.
 assert_hotfix_db_readable() {
-  ( "$ROOT/iso/assert-hotfix-db.sh" ) || {
+  # $ROOT is iso/, not the repository root, so "$ROOT/iso/..." is iso/iso/...
+  # and the gate died with "no such file" while printing an explanation about
+  # the parser. Check the path first and say which of the two it actually is.
+  local gate="$REPO/iso/assert-hotfix-db.sh"
+  if [ ! -f "$gate" ]; then
+    echo "build: $gate is missing, so the hotfix database was never checked." >&2
+    exit 1
+  fi
+  ( cd "$REPO" && "$gate" ) || {
     echo "build: the hotfix database did not survive the parser." >&2
     echo "       Every entry but the last would be silently ignored on a" >&2
     echo "       live system, with no error and no change." >&2

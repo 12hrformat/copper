@@ -185,6 +185,12 @@ static void boot_sequence(void) {
     int skip = 0;
     for (int i = 0; i < vis_rows; i++) {
         at(start_row + i, indent + 1);
+        /* Clip to what the terminal actually has. The shield is 77 columns and
+           the console is 80, so this is a no-op there -- but on a narrower
+           terminal an unclipped fputs() runs past the right edge, the terminal
+           wraps it onto the next row, and every row below is drawn one line
+           too low. That is the same class of bug as the splash jumping, and
+           it was fixed once already. */
         printf("%.*s", vis_cols, COPPER_SHIELD[i]);
         fflush(stdout);
         if (!skip) {
@@ -203,8 +209,26 @@ static void boot_sequence(void) {
     int wm_rows = COPPER_WORDMARK_ROWS;
     int wm_cols = COPPER_WORDMARK_WIDTH;
     if (wm_cols > term_cols) wm_cols = term_cols;
-    int wm_top = (term_rows - wm_rows) / 2 + 1;
+
+    /* Clamp the rows to the terminal, and when it does not fit show it from
+       the top and let the bottom be cut. Identical to the shield's rule and
+       needed for the same reason: writing on or below the last row is what
+       makes a terminal scroll, which is the one thing this routine exists to
+       prevent.
+
+       The wordmark had no clamp at all. wm_top went negative and was then
+       forced to 1, so on a terminal shorter than 18 rows it addressed rows
+       below the bottom edge and scrolled the display. The 50x14 pty case hit
+       it and took the emulator down with an index error before it could check
+       anything else, which is why nothing caught it until now. */
+    int wm_top = 1;
+    if (wm_rows > term_rows) {
+        wm_rows = term_rows;
+    } else {
+        wm_top = (term_rows - wm_rows) / 2 + 1;
+    }
     if (wm_top < 1) wm_top = 1;
+
     int wm_left = (term_cols - wm_cols) / 2 + 1;
     if (wm_left < 1) wm_left = 1;
     for (int i = 0; i < wm_rows; i++) {
@@ -550,7 +574,23 @@ static int create_user_direct(const char *user) {
         fclose(chk);
     }
 
-    /* Find an unused uid by scanning the passwd file for the numeric ids. */
+    /* Find an unused uid by scanning the passwd file for the numeric ids.
+
+       A passwd record is name:passwd:uid:gid:gecos:home:shell, so the uid is
+       the THIRD field. This used to read the second one:
+
+           char *c1 = strchr(line, ':');
+           int v = atoi(c1 + 1);          <-- the password field
+
+       which is "x" on every normal account. atoi("x") is 0, the v > 0 test
+       threw it away, and used[] came out all zeros. So the scan below had
+       nothing to avoid and every account got 1000, colliding with whatever
+       was already there.
+
+       Two accounts sharing a uid is not cosmetic: the kernel compares home
+       directory ownership numerically, so the first user owns the second
+       user's files outright. Found by the account test, which seeded a
+       passwd file containing uid 1000 and was handed 1000 anyway. */
     int uid = 1000;
     FILE *p = fopen("/etc/passwd", "r");
     if (p) {
@@ -560,11 +600,14 @@ static int create_user_direct(const char *user) {
         while (fgets(line, sizeof line, p)) {
             char *c1 = strchr(line, ':');
             if (!c1) continue;
-            int v = atoi(c1 + 1);
+            char *c2 = strchr(c1 + 1, ':');
+            if (!c2) continue;
+            int v = atoi(c2 + 1);          /* third field: uid */
             if (v > 0 && v < 65536) used[v] = 1;
         }
         fclose(p);
         while (uid < 65535 && used[uid]) uid++;
+        if (uid >= 65535) return 1;   /* no id left; do not reuse one */
     }
 
     char home[128], gecos[256];
@@ -596,7 +639,18 @@ static int create_user_direct(const char *user) {
 
     /* shadow: locked, no password. set_password() fills it in moments later;
        starting locked means there is no window where the account has an empty
-       password and is reachable from a console. */
+       password and is reachable from a console.
+
+       Nine fields, in this order:
+         name : passwd : lastchg : min : max : warn : inactive : expire : flag
+
+       This used to write "%s:!::0:0:99999:7:::", which is TEN fields: the
+       empty lastchg pushed everything right by one, so max landed on warn,
+       99999 landed on inactive, and 7 landed on expire. On a live boot
+       busybox chpasswd rewrites the line moments later and hides it, so it
+       only shows up when chpasswd is missing -- and then the account is left
+       holding a record no shadow parser will accept, which is the same class
+       of fault as the trailing-newline weld this file already had to fix. */
     int have_shadow = 0;
     FILE *s = fopen("/etc/shadow", "r");
     if (s) {
@@ -609,7 +663,7 @@ static int create_user_direct(const char *user) {
     }
     if (!have_shadow) {
         s = fopen("/etc/shadow", "a");
-        if (s) { fprintf(s, "%s:!::0:0:99999:7:::\n", user); fclose(s); }
+        if (s) { fprintf(s, "%s:!:0:0:99999:7:::\n", user); fclose(s); }
     }
 
     /* home directory, owned by the new user */
